@@ -1,7 +1,6 @@
 """
 Agent-Based Model: Homeless Population & Emergency Department Utilization
 
-
 Extensions over baseline model:
   - Agent demographics: age, gender
   - Seasonal admission boost (winter afflictions)
@@ -10,47 +9,61 @@ Extensions over baseline model:
   - Cost tracking: per-day bed cost, savings from interventions
   - Scenario comparison: baseline vs shelter vs housing vs combined
 
-Data plug-in: replace the PARAMETERS section values once real data arrives.
+Admission logic (updated):
+  - Arrivals:   n_arrivals  ~ Poisson(ARRIVAL_LAMBDA)   -- ED footfall
+  - Admissions: n_pool      ~ Poisson(ADMISSION_LAMBDA) -- independent draw
+                n_admissions ~ Binomial(n_pool, p)
+  - p = ADMISSION_PROB  (placeholder = 0.10)
+    --> swap with  Z59 / (NFA + Z59)  once real data arrives
+
+Data plug-in: replace values in the PARAMETERS section below.
 All distribution parameters are clearly labelled and isolated.
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
+from collections import Counter
 
 
 # =============================================================================
 # PARAMETERS  <-- swap these out when real data arrives
 # =============================================================================
 
-# Arrival & admission
-ARRIVAL_LAMBDA      = 3        # Poisson mean: new homeless individuals arriving per month
-ADMISSION_PROB      = 0.10     # Binomial p: probability an arrival is admitted
-LOS_MEAN_DAYS       = 15.4     # Normal mean: length of stay (days)
-LOS_SD_DAYS         = 2.0      # Normal SD: length of stay (days)
-INITIAL_POPULATION  = 80       # Starting homeless population (not yet admitted)
+# Arrival process
+ARRIVAL_LAMBDA          = 3        # Poisson mean: new homeless individuals arriving at ED per month
 
-# Seasonal parameters (winter = months 11,12,1,2,3)
-WINTER_MONTHS       = {11, 12, 1, 2, 3}
-SEASONAL_ADMISSION_BOOST = 0.05   # Additional admission probability in winter months
+# Admission process  (INDEPENDENT of arrivals)
+ADMISSION_LAMBDA        = 11       # Poisson mean: pool size n for Binomial admission draw
+ADMISSION_PROB          = 0.10     # Binomial p: placeholder → replace with Z59 / (NFA + Z59)
 
-# Demographics (proportions, used for sampling)
-# Source: adjust once real data available
-GENDER_PROBS        = {"Male": 0.70, "Female": 0.26, "Other": 0.04}
-AGE_GROUPS          = ["18-29", "30-44", "45-59", "60+"]
-AGE_PROBS           = [0.20,    0.35,    0.30,    0.15]   # proportions
+# Length of stay
+LOS_MEAN_DAYS           = 15.4     # Normal mean: length of stay (days)
+LOS_SD_DAYS             = 2.0      # Normal SD:   length of stay (days)
+
+# Starting population
+INITIAL_POPULATION      = 80       # Homeless individuals in system at t=0 (not yet admitted)
+
+# Seasonal parameters  (winter = months 11, 12, 1, 2, 3)
+WINTER_MONTHS               = {11, 12, 1, 2, 3}
+SEASONAL_ADMISSION_BOOST    = 0.05   # Extra admission probability in winter months
+
+# Demographics  (adjust proportions once real data arrives)
+GENDER_PROBS    = {"Male": 0.70, "Female": 0.26, "Other": 0.04}
+AGE_GROUPS      = ["18-29", "30-44", "45-59", "60+"]
+AGE_PROBS       = [0.20,    0.35,    0.30,    0.15]
 
 # Cost parameters
-COST_PER_BED_DAY    = 1500     # CAD; typical acute care cost per bed-day in BC
-SHELTER_COST_MONTHLY = 50000   # CAD; monthly cost to run an additional shelter
+COST_PER_BED_DAY        = 1500     # CAD; acute care cost per bed-day in BC
+SHELTER_COST_MONTHLY    = 50000    # CAD; monthly operating cost of an additional shelter
 
-# Intervention parameters
-# Shelter intervention: reduces monthly arrivals reaching ED
+# Intervention — shelter (diverts arrivals, reduces admission probability)
 SHELTER_ARRIVAL_REDUCTION   = 0.25   # fraction of arrivals diverted by shelter
-SHELTER_ADMISSION_REDUCTION = 0.05   # additional reduction in admission probability
-# Housing/preventative care: reduces length of stay
+SHELTER_ADMISSION_REDUCTION = 0.05   # additional reduction in admission probability p
+
+# Intervention — housing / preventative care (reduces length of stay)
 HOUSING_LOS_REDUCTION_DAYS  = 3.0   # days shaved off average LOS
 
 
@@ -60,32 +73,32 @@ HOUSING_LOS_REDUCTION_DAYS  = 3.0   # days shaved off average LOS
 
 @dataclass
 class Agent:
-    agent_id: int
-    arrival_month: int
-    gender: str = "Male"
-    age_group: str = "30-44"
+    agent_id:       int
+    arrival_month:  int
+    gender:         str   = "Male"
+    age_group:      str   = "30-44"
 
-    admitted: bool = False
-    admission_month: Optional[int] = None
-    length_of_stay_days: float = 0.0
-    remaining_days: float = 0.0
-    discharged: bool = False
-    discharge_month: Optional[int] = None
-    total_bed_days: float = 0.0   # accumulates for cost calculation
+    admitted:               bool          = False
+    admission_month:        Optional[int] = None
+    length_of_stay_days:    float         = 0.0
+    remaining_days:         float         = 0.0
+    discharged:             bool          = False
+    discharge_month:        Optional[int] = None
+    total_bed_days:         float         = 0.0   # accumulates for cost calculation
 
     def admit(self, month: int, los_days: float):
-        self.admitted = True
-        self.admission_month = month
-        self.length_of_stay_days = los_days
-        self.remaining_days = los_days
+        self.admitted               = True
+        self.admission_month        = month
+        self.length_of_stay_days    = los_days
+        self.remaining_days         = los_days
 
     def update_one_month(self, current_month: int, days_in_month: int = 30):
         if self.admitted and not self.discharged:
-            days_this_month = min(self.remaining_days, days_in_month)
+            days_this_month      = min(self.remaining_days, days_in_month)
             self.total_bed_days += days_this_month
             self.remaining_days -= days_in_month
             if self.remaining_days <= 0:
-                self.discharged = True
+                self.discharged     = True
                 self.discharge_month = current_month
 
 
@@ -94,51 +107,51 @@ class Agent:
 # =============================================================================
 
 def run_simulation(
-    months: int = 24,
-    initial_agents: int = INITIAL_POPULATION,
-    arrival_lambda: float = ARRIVAL_LAMBDA,
-    admission_prob: float = ADMISSION_PROB,
-    los_mean: float = LOS_MEAN_DAYS,
-    los_sd: float = LOS_SD_DAYS,
-    seasonal: bool = True,
-    shelter_intervention: bool = False,
-    housing_intervention: bool = False,
-    seed: int = 42,
-    start_month: int = 1,          # calendar month of month-1 (1=Jan, used for seasons)
+    months:                 int   = 24,
+    initial_agents:         int   = INITIAL_POPULATION,
+    arrival_lambda:         float = ARRIVAL_LAMBDA,
+    admission_lambda:       float = ADMISSION_LAMBDA,   # <-- NEW: independent Poisson mean
+    admission_prob:         float = ADMISSION_PROB,     # <-- swap with Z59/(NFA+Z59) when ready
+    los_mean:               float = LOS_MEAN_DAYS,
+    los_sd:                 float = LOS_SD_DAYS,
+    seasonal:               bool  = True,
+    shelter_intervention:   bool  = False,
+    housing_intervention:   bool  = False,
+    seed:                   int   = 42,
+    start_month:            int   = 1,   # calendar month corresponding to sim month 1
 ) -> dict:
     """
     Run one scenario of the ABM.
 
-    Parameters
-    ----------
-    shelter_intervention : bool
-        If True, applies SHELTER_ARRIVAL_REDUCTION and SHELTER_ADMISSION_REDUCTION.
-    housing_intervention : bool
-        If True, reduces LOS by HOUSING_LOS_REDUCTION_DAYS.
-    seasonal : bool
-        If True, applies SEASONAL_ADMISSION_BOOST in winter months.
-    start_month : int
-        The calendar month (1-12) corresponding to simulation month 1.
+    Admission logic
+    ---------------
+    Each month:
+      1. n_pool        ~ Poisson(admission_lambda)          -- independent of arrivals
+      2. n_admissions  ~ Binomial(n_pool, eff_adm_prob)
+      3. Admitted agents are drawn from ALL currently unadmitted agents in the system.
+
+    When real data arrives
+    ----------------------
+    Replace admission_prob with:   Z59 / (NFA + Z59)
     """
     rng = np.random.default_rng(seed)
 
-    agents = []
+    gender_keys = list(GENDER_PROBS.keys())
+    gender_vals = list(GENDER_PROBS.values())
+
+    # Effective LOS (housing intervention shaves days off)
+    eff_los_mean = max(1.0, los_mean - (HOUSING_LOS_REDUCTION_DAYS if housing_intervention else 0))
+
+    # ----- Initialise population -----
+    agents       = []
     next_agent_id = 0
-
-    gender_keys   = list(GENDER_PROBS.keys())
-    gender_vals   = list(GENDER_PROBS.values())
-
-    # Effective LOS
-    eff_los_mean = los_mean - (HOUSING_LOS_REDUCTION_DAYS if housing_intervention else 0)
-    eff_los_mean = max(1.0, eff_los_mean)
-
-    # Initial population
     for _ in range(initial_agents):
         g = rng.choice(gender_keys, p=gender_vals)
-        a = rng.choice(AGE_GROUPS, p=AGE_PROBS)
+        a = rng.choice(AGE_GROUPS,  p=AGE_PROBS)
         agents.append(Agent(next_agent_id, arrival_month=0, gender=g, age_group=a))
         next_agent_id += 1
 
+    # ----- Monthly accumulators -----
     monthly_arrivals    = []
     monthly_admissions  = []
     monthly_discharges  = []
@@ -147,71 +160,77 @@ def run_simulation(
     monthly_cost        = []
 
     for sim_month in range(1, months + 1):
-        cal_month = ((start_month - 1 + sim_month - 1) % 12) + 1  # 1-12
+        cal_month = ((start_month - 1 + sim_month - 1) % 12) + 1   # 1-12
 
-        # ---- 1. Update admitted agents ----
+        # ---- 1. Update admitted agents; count bed-days and discharges ----
         discharges_this_month = 0
         bed_days_this_month   = 0.0
         for agent in agents:
             prev_remaining = agent.remaining_days
-            was_in = agent.admitted and not agent.discharged
+            was_in         = agent.admitted and not agent.discharged
             agent.update_one_month(sim_month)
             if was_in:
                 bed_days_this_month += min(prev_remaining, 30)
-            if was_in and agent.discharged:
-                discharges_this_month += 1
+                if agent.discharged:
+                    discharges_this_month += 1
 
-        # ---- 2. Effective arrival rate (shelter diverts some) ----
-        eff_lambda = arrival_lambda
-        if shelter_intervention:
-            eff_lambda = arrival_lambda * (1 - SHELTER_ARRIVAL_REDUCTION)
-
+        # ---- 2. New arrivals (shelter diverts a fraction) ----
+        eff_lambda = arrival_lambda * (1 - SHELTER_ARRIVAL_REDUCTION) if shelter_intervention else arrival_lambda
         n_arrivals = rng.poisson(eff_lambda)
 
-        new_agents = []
         for _ in range(n_arrivals):
             g = rng.choice(gender_keys, p=gender_vals)
-            a = rng.choice(AGE_GROUPS, p=AGE_PROBS)
-            new_agents.append(Agent(next_agent_id, arrival_month=sim_month, gender=g, age_group=a))
+            a = rng.choice(AGE_GROUPS,  p=AGE_PROBS)
+            agents.append(Agent(next_agent_id, arrival_month=sim_month, gender=g, age_group=a))
             next_agent_id += 1
-        agents.extend(new_agents)
 
-        # ---- 3. Admissions ----
+        # ---- 3. Admissions: INDEPENDENT Poisson draw → Binomial ----
+        #
+        #   n_pool       ~ Poisson(admission_lambda)   [independent of arrivals]
+        #   n_admissions ~ Binomial(n_pool, p)
+        #
+        #   p = ADMISSION_PROB  (placeholder 10%)
+        #   → replace with  Z59 / (NFA + Z59)  once data arrives
+        #
         eff_adm_prob = admission_prob
         if seasonal and cal_month in WINTER_MONTHS:
             eff_adm_prob = min(1.0, eff_adm_prob + SEASONAL_ADMISSION_BOOST)
         if shelter_intervention:
             eff_adm_prob = max(0.0, eff_adm_prob - SHELTER_ADMISSION_REDUCTION)
 
-        n_admissions = rng.binomial(n_arrivals, eff_adm_prob)
-        if n_arrivals > 0 and n_admissions > 0:
-            admitted_indices = rng.choice(n_arrivals, size=n_admissions, replace=False)
-            for idx in admitted_indices:
+        n_pool       = rng.poisson(admission_lambda)          # independent draw
+        n_admissions = rng.binomial(n_pool, eff_adm_prob)
+
+        # Draw from ALL unadmitted agents currently in the system
+        eligible   = [a for a in agents if not a.admitted and not a.discharged]
+        n_to_admit = min(n_admissions, len(eligible))
+        if n_to_admit > 0:
+            chosen = rng.choice(len(eligible), size=n_to_admit, replace=False)
+            for idx in chosen:
                 los_days = max(1.0, rng.normal(eff_los_mean, los_sd))
-                new_agents[idx].admit(sim_month, los_days)
+                eligible[idx].admit(sim_month, los_days)
 
         # ---- 4. Occupancy & cost ----
-        occupancy = sum(1 for a in agents if a.admitted and not a.discharged)
-
+        occupancy          = sum(1 for a in agents if a.admitted and not a.discharged)
         monthly_cost_value = bed_days_this_month * COST_PER_BED_DAY
         if shelter_intervention:
             monthly_cost_value += SHELTER_COST_MONTHLY
 
         monthly_arrivals.append(n_arrivals)
-        monthly_admissions.append(n_admissions)
+        monthly_admissions.append(n_to_admit)   # actual admissions (capped by eligible pool)
         monthly_discharges.append(discharges_this_month)
         monthly_occupancy.append(occupancy)
         monthly_bed_days.append(bed_days_this_month)
         monthly_cost.append(monthly_cost_value)
 
     return {
-        "agents":              agents,
-        "monthly_arrivals":    monthly_arrivals,
-        "monthly_admissions":  monthly_admissions,
-        "monthly_discharges":  monthly_discharges,
-        "monthly_occupancy":   monthly_occupancy,
-        "monthly_bed_days":    monthly_bed_days,
-        "monthly_cost":        monthly_cost,
+        "agents":             agents,
+        "monthly_arrivals":   monthly_arrivals,
+        "monthly_admissions": monthly_admissions,
+        "monthly_discharges": monthly_discharges,
+        "monthly_occupancy":  monthly_occupancy,
+        "monthly_bed_days":   monthly_bed_days,
+        "monthly_cost":       monthly_cost,
     }
 
 
@@ -219,8 +238,8 @@ def run_simulation(
 # SCENARIO COMPARISON
 # =============================================================================
 
-def run_all_scenarios(months=24, seed=42):
-    scenarios = {
+def run_all_scenarios(months: int = 24, seed: int = 42) -> dict:
+    return {
         "Baseline":           run_simulation(months=months, seed=seed,
                                              shelter_intervention=False, housing_intervention=False),
         "Shelter":            run_simulation(months=months, seed=seed,
@@ -230,7 +249,6 @@ def run_all_scenarios(months=24, seed=42):
         "Combined":           run_simulation(months=months, seed=seed,
                                              shelter_intervention=True,  housing_intervention=True),
     }
-    return scenarios
 
 
 # =============================================================================
@@ -261,14 +279,13 @@ def plot_scenarios(scenarios: dict, months: int = 24):
         ax2.plot(month_axis, res["monthly_admissions"], color=c, marker='s', ms=4, label=name)
         ax3.plot(month_axis, res["monthly_occupancy"],  color=c, marker='d', ms=4, label=name)
         ax4.plot(month_axis, res["monthly_discharges"], color=c, marker='^', ms=4, label=name)
-        cumcost = np.cumsum(res["monthly_cost"]) / 1e6
-        ax5.plot(month_axis, cumcost, color=c, lw=2.5, label=name)
+        ax5.plot(month_axis, np.cumsum(res["monthly_cost"]) / 1e6, color=c, lw=2.5, label=name)
 
     for ax, title, ylabel in [
-        (ax1, "Monthly ED Arrivals",      "# Arrivals"),
-        (ax2, "Monthly Admissions",       "# Admissions"),
-        (ax3, "Hospital Occupancy (EOM)", "# Beds Occupied"),
-        (ax4, "Monthly Discharges",       "# Discharges"),
+        (ax1, "Monthly ED Arrivals",        "# Arrivals"),
+        (ax2, "Monthly Admissions",         "# Admissions"),
+        (ax3, "Hospital Occupancy (EOM)",   "# Beds Occupied"),
+        (ax4, "Monthly Discharges",         "# Discharges"),
     ]:
         ax.set_title(title); ax.set_xlabel("Month"); ax.set_ylabel(ylabel)
         ax.legend(fontsize=7); ax.grid(alpha=0.3)
@@ -278,35 +295,29 @@ def plot_scenarios(scenarios: dict, months: int = 24):
     ax5.legend(); ax5.grid(alpha=0.3)
 
     fig.suptitle("Homeless ED Utilization ABM — Scenario Comparison", fontsize=14, fontweight='bold')
-    plt.savefig("outputs/scenario_comparison.png", dpi=150, bbox_inches='tight')
+    plt.tight_layout()
     plt.show()
 
 
 def plot_demographics(scenarios: dict):
-    """Show age & gender breakdown of admitted agents for baseline."""
     baseline_agents = [a for a in scenarios["Baseline"]["agents"] if a.admitted]
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
-    # Gender
-    from collections import Counter
     gender_counts = Counter(a.gender for a in baseline_agents)
     axes[0].bar(gender_counts.keys(), gender_counts.values(),
                 color=["#3498db", "#e74c3c", "#95a5a6"])
     axes[0].set_title("Admitted Agents by Gender (Baseline)")
     axes[0].set_ylabel("Count")
 
-    # Age group
     age_counts = Counter(a.age_group for a in baseline_agents)
     age_order  = ["18-29", "30-44", "45-59", "60+"]
-    axes[1].bar(age_order, [age_counts.get(g, 0) for g in age_order],
-                color="#2ecc71")
+    axes[1].bar(age_order, [age_counts.get(g, 0) for g in age_order], color="#2ecc71")
     axes[1].set_title("Admitted Agents by Age Group (Baseline)")
     axes[1].set_ylabel("Count")
 
     fig.suptitle("Demographics of Admitted Homeless Individuals", fontsize=12, fontweight='bold')
     plt.tight_layout()
-    plt.savefig("outputs/demographics.png", dpi=150, bbox_inches='tight')
     plt.show()
 
 
@@ -315,19 +326,19 @@ def plot_demographics(scenarios: dict):
 # =============================================================================
 
 def print_summary(scenarios: dict):
-    print("\n" + "="*70)
+    print("\n" + "="*75)
     print(f"{'Scenario':<22} {'Arrivals':>9} {'Admissions':>11} {'Bed-Days':>10} {'Total Cost (M CAD)':>19} {'vs Baseline':>12}")
-    print("="*70)
+    print("="*75)
     baseline_cost = sum(scenarios["Baseline"]["monthly_cost"])
     for name, res in scenarios.items():
-        arrivals    = sum(res["monthly_arrivals"])
-        admissions  = sum(res["monthly_admissions"])
-        bed_days    = sum(res["monthly_bed_days"])
-        total_cost  = sum(res["monthly_cost"])
-        saving      = baseline_cost - total_cost
-        saving_str  = f"-${saving/1e6:.3f}M" if saving > 0 else f"+${abs(saving)/1e6:.3f}M"
+        arrivals   = sum(res["monthly_arrivals"])
+        admissions = sum(res["monthly_admissions"])
+        bed_days   = sum(res["monthly_bed_days"])
+        total_cost = sum(res["monthly_cost"])
+        saving     = baseline_cost - total_cost
+        saving_str = f"-${saving/1e6:.3f}M" if saving > 0 else f"+${abs(saving)/1e6:.3f}M"
         print(f"{name:<22} {arrivals:>9} {admissions:>11} {bed_days:>10.0f} {total_cost/1e6:>19.3f} {saving_str:>12}")
-    print("="*70 + "\n")
+    print("="*75 + "\n")
 
 
 # =============================================================================
@@ -343,5 +354,3 @@ if __name__ == "__main__":
     print_summary(scenarios)
     plot_scenarios(scenarios, months=MONTHS)
     plot_demographics(scenarios)
-
-    print("Plots saved to outputs/")
