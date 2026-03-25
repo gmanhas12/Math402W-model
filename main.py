@@ -33,7 +33,7 @@ from collections import Counter
 # =============================================================================
 
 # Arrival process
-ARRIVAL_LAMBDA          = 3        # Poisson mean: new homeless individuals arriving at ED per month
+ARRIVAL_LAMBDA          = 11        # Poisson mean: new homeless individuals arriving at ED per month
 
 # Admission process  (INDEPENDENT of arrivals)
 ADMISSION_LAMBDA        = 11       # Poisson mean: pool size n for Binomial admission draw
