@@ -533,7 +533,7 @@ def plot_scenarios(scenarios: dict, months: int = SIM_MONTHS):
         fontsize=13, fontweight='bold'
     )
     plt.tight_layout()
-    plt.savefig("/mnt/user-data/outputs/scenario_comparison.png", dpi=150, bbox_inches='tight')
+    plt.savefig("outputs/scenario_comparison.png", dpi=150, bbox_inches='tight')
     plt.show()
 
 
@@ -561,7 +561,7 @@ def plot_population_flows(scenarios: dict, months: int = SIM_MONTHS):
 
     fig.suptitle("Open-Population Dynamics — All Scenarios", fontsize=12, fontweight='bold')
     plt.tight_layout()
-    plt.savefig("/mnt/user-data/outputs/population_flows.png", dpi=150, bbox_inches='tight')
+    plt.savefig("outputs/population_flows.png", dpi=150, bbox_inches='tight')
     plt.show()
 
 
@@ -597,7 +597,7 @@ def plot_demographics(scenarios: dict):
 
     fig.suptitle("Demographics of Admitted Homeless Individuals — Baseline", fontsize=12, fontweight='bold')
     plt.tight_layout()
-    plt.savefig("/mnt/user-data/outputs/demographics.png", dpi=150, bbox_inches='tight')
+    plt.savefig("outputs/demographics.png", dpi=150, bbox_inches='tight')
     plt.show()
 
 
@@ -641,7 +641,7 @@ def plot_cost_per_day_comparison():
             bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
 
     plt.tight_layout()
-    plt.savefig("/mnt/user-data/outputs/cost_per_day_comparison.png", dpi=150, bbox_inches='tight')
+    plt.savefig("outputs/cost_per_day_comparison.png", dpi=150, bbox_inches='tight')
     plt.show()
 
 
