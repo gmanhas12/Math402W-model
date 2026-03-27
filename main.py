@@ -536,7 +536,7 @@ def plot_main(scenarios: dict, months: int = SIM_MONTHS):
         fontsize=13, fontweight='bold'
     )
     plt.tight_layout()
-    plt.savefig("/mnt/user-data/outputs/powell_river_main.png", dpi=150, bbox_inches='tight')
+    plt.savefig("outputs/powell_river_main.png", dpi=150, bbox_inches='tight')
     plt.show()
     print("Saved: powell_river_main.png")
 
@@ -572,7 +572,7 @@ def plot_cost_breakdown(scenarios: dict, months: int = SIM_MONTHS):
     ax.grid(axis='y', alpha=0.25)
 
     plt.tight_layout()
-    plt.savefig("/mnt/user-data/outputs/powell_river_cost_breakdown.png", dpi=150, bbox_inches='tight')
+    plt.savefig("outputs/powell_river_cost_breakdown.png", dpi=150, bbox_inches='tight')
     plt.show()
     print("Saved: powell_river_cost_breakdown.png")
 
@@ -609,7 +609,7 @@ def plot_cost_per_night():
     ax.grid(axis='y', alpha=0.25)
 
     plt.tight_layout()
-    plt.savefig("/mnt/user-data/outputs/powell_river_cost_per_night.png", dpi=150, bbox_inches='tight')
+    plt.savefig("outputs/powell_river_cost_per_night.png", dpi=150, bbox_inches='tight')
     plt.show()
     print("Saved: powell_river_cost_per_night.png")
 
@@ -644,7 +644,7 @@ def plot_demographics(scenarios: dict):
     fig.suptitle("Demographics — Admitted Homeless Individuals, Powell River ABM (Baseline)",
                  fontsize=12, fontweight='bold')
     plt.tight_layout()
-    plt.savefig("/mnt/user-data/outputs/powell_river_demographics.png", dpi=150, bbox_inches='tight')
+    plt.savefig("outputs/powell_river_demographics.png", dpi=150, bbox_inches='tight')
     plt.show()
     print("Saved: powell_river_demographics.png")
 
