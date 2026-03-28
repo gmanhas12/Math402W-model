@@ -10,7 +10,7 @@ Real-world context
                  → zero shelter beds from March 2025 onward
   Sim start    : April 2026
   Driftwood    : 40-bed shelter at 7104 Barnet St opens April 2026 (month 1)
-  Population   : 80 homeless individuals (2023 PiT count)
+  Population   : ~126 homeless individuals (2023 PiT count)
 
 Scenarios
 ---------
@@ -83,23 +83,35 @@ WINTER_MONTHS               = {11, 12, 1, 2, 3}
 SEASONAL_ADMISSION_BOOST    = 0.05   # extra admission prob in winter months
 
 # ── Demographics ──────────────────────────────────────────────────────────────
+# BC Coroners data: 79% male, skewed 30-49
 # ← SWAP with real age/gender from qathet hospital data
 GENDER_PROBS = {"Male": 0.70, "Female": 0.26, "Other": 0.04}
 AGE_GROUPS   = ["18-29", "30-44", "45-59", "60+"]
 AGE_PROBS    = [0.20,    0.35,    0.30,    0.15]
 
 # ── Cost parameters ───────────────────────────────────────────────────────────
-COST_HOSPITAL_BED_DAY           = 1_500   # CAD; BC acute-care bed-day (CIHI estimate)
+# qathet General Hospital — 42 beds total: 3 ICU + 39 non-ICU
+HOSPITAL_ICU_BEDS               = 3
+HOSPITAL_NON_ICU_BEDS           = 39      # 42 - 3
+COST_ICU_BED_DAY_LOW            = 7_000   # CAD; ICU bed-day lower bound
+COST_ICU_BED_DAY_HIGH           = 10_000  # CAD; ICU bed-day upper bound
+COST_NON_ICU_BED_DAY            = 1_100   # CAD; non-ICU acute bed-day
 
-# Driftwood / year-round shelter (based on Sechelt RainCity ~$900k/yr for 35 beds)
-# Scaled to 40 beds → ~$1.03M/yr → ~$85,700/month total
+# Weighted average bed-day cost used in simulation:
+# (3 ICU × midpoint $8,500 + 39 non-ICU × $1,100) / 42  ≈ $1,624/day blended
+_ICU_MID                        = (COST_ICU_BED_DAY_LOW + COST_ICU_BED_DAY_HIGH) / 2
+COST_HOSPITAL_BED_DAY           = round(
+    (HOSPITAL_ICU_BEDS * _ICU_MID + HOSPITAL_NON_ICU_BEDS * COST_NON_ICU_BED_DAY)
+    / (HOSPITAL_ICU_BEDS + HOSPITAL_NON_ICU_BEDS)
+)
+
+# Driftwood shelter — confirmed $1.6M/yr operating cost
 DRIFTWOOD_CAPACITY              = 40      # beds
-DRIFTWOOD_FIXED_MONTHLY         = 85_700  # CAD; total operating cost/month
-                                          # ← SWAP with actual BC Housing contract value
+DRIFTWOOD_FIXED_MONTHLY         = 133_333 # CAD; $1,600,000 / 12
 
 # Additional 40-bed shelter (same cost structure as Driftwood)
 ADDITIONAL_SHELTER_CAPACITY     = 40
-ADDITIONAL_SHELTER_FIXED_MONTHLY = 85_700
+ADDITIONAL_SHELTER_FIXED_MONTHLY = 133_333
 
 # Warming centre (Oct–Apr; 20 beds; lower cost than year-round shelter)
 WARMING_CENTRE_CAPACITY         = 20
@@ -472,6 +484,127 @@ def print_summary(scenarios: dict):
     print("=" * w + "\n")
 
 
+
+# =============================================================================
+# BREAK-EVEN ANALYSIS
+# =============================================================================
+
+def breakeven_analysis(scenarios: dict, months: int = SIM_MONTHS) -> dict:
+    """
+    For each non-baseline scenario, find the month at which cumulative hospital
+    savings exceed cumulative shelter operating costs.
+
+    Break-even when:
+        sum(baseline_hospital_cost[0:t]) - sum(scenario_hospital_cost[0:t])
+        >= sum(scenario_shelter_cost[0:t])
+    """
+    baseline      = list(scenarios.values())[0]
+    baseline_hosp = np.array(baseline["monthly_cost_hospital"])
+    results       = {}
+
+    for name, res in list(scenarios.items())[1:]:   # skip Baseline
+        scen_hosp    = np.array(res["monthly_cost_hospital"])
+        scen_shelter = np.array(res["monthly_cost_shelter"])
+        cum_savings  = np.cumsum(baseline_hosp - scen_hosp)
+        cum_shelter  = np.cumsum(scen_shelter)
+        net          = cum_savings - cum_shelter
+
+        breakeven_month = None
+        for t, n in enumerate(net, start=1):
+            if n >= 0:
+                breakeven_month = t
+                break
+
+        results[name] = dict(
+            breakeven_month  = breakeven_month,
+            cum_savings      = cum_savings,
+            cum_shelter_cost = cum_shelter,
+            net              = net,
+        )
+    return results
+
+
+def print_breakeven(scenarios: dict):
+    """Print break-even table to console."""
+    month_names = ["Jan","Feb","Mar","Apr","May","Jun",
+                   "Jul","Aug","Sep","Oct","Nov","Dec"]
+    be = breakeven_analysis(scenarios)
+
+    print("\n" + "=" * 72)
+    print("BREAK-EVEN ANALYSIS")
+    print("(Month when cumulative hospital savings exceed shelter operating costs)")
+    print("=" * 72)
+    print(f"{'Scenario':<40} {'Break-even':>12} {'Calendar date':>16} {'Net saving at end':>18}")
+    print("-" * 72)
+
+    for name, data in be.items():
+        label   = name.replace("\n", " ")
+        bm      = data["breakeven_month"]
+        net_end = data["net"][-1]
+
+        if bm is not None:
+            cal_idx = ((SIM_START_MONTH - 1 + bm - 1) % 12)
+            yr      = 26 + ((SIM_START_MONTH - 1 + bm - 1) // 12)
+            cal_str = f"{month_names[cal_idx]} 20{yr}"
+            bm_str  = f"Month {bm}"
+        else:
+            cal_str = "Beyond simulation window"
+            bm_str  = f"> {SIM_MONTHS} months"
+
+        net_str = f"${net_end/1e6:.3f}M" if net_end >= 0 else f"-${abs(net_end)/1e6:.3f}M"
+        print(f"{label:<40} {bm_str:>12} {cal_str:>16} {net_str:>18}")
+
+    print("=" * 72 + "\n")
+
+
+def plot_breakeven(scenarios: dict, months: int = SIM_MONTHS):
+    """
+    Line chart: cumulative net saving (hospital savings minus shelter costs).
+    X-axis crossing = break-even point.
+    """
+    be     = breakeven_analysis(scenarios, months)
+    labels = _month_labels(months)
+    x      = np.arange(1, months + 1)
+
+    fig, ax = plt.subplots(figsize=(13, 5))
+    ax.axhline(0, color="black", lw=1.8, ls="--", label="Break-even line (net = $0)")
+
+    for name, data in be.items():
+        c   = COLORS[name]
+        net = data["net"] / 1e6
+        ax.plot(x, net, color=c, lw=2.5, marker="o", ms=3.5,
+                label=name.replace("\n", " "))
+
+        bm = data["breakeven_month"]
+        if bm is not None:
+            ax.axvline(bm, color=c, lw=1.2, ls=":", alpha=0.7)
+            # Label above the line so they don't overlap
+            y_label = data["net"][min(bm, months - 1)] / 1e6
+            ax.annotate(
+                f"Month {bm}",
+                xy=(bm, 0),
+                xytext=(bm + 0.4, max(y_label * 0.4, 0.03)),
+                fontsize=7.5, color=c, fontweight="bold",
+                arrowprops=dict(arrowstyle="->", color=c, lw=1),
+            )
+
+    tick_every = 3
+    ax.set_xticks(x[::tick_every])
+    ax.set_xticklabels(labels[::tick_every], rotation=35, ha="right", fontsize=7.5)
+    ax.set_ylabel("Cumulative Net Saving vs Baseline (M CAD)\n"
+                  "[hospital savings  minus  shelter operating costs]")
+    ax.set_title(
+        "Break-Even Analysis — When Do Shelter Interventions Pay For Themselves?\n"
+        "Positive values = shelter has more than paid for itself through hospital savings",
+        fontsize=10,
+    )
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig("outputs/powell_river_breakeven.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("Saved: powell_river_breakeven.png")
+
 # =============================================================================
 # PLOTTING
 # =============================================================================
@@ -578,35 +711,86 @@ def plot_cost_breakdown(scenarios: dict, months: int = SIM_MONTHS):
 
 
 def plot_cost_per_night():
-    """Reference chart: cost per night by care setting."""
-    settings = ["Hospital\nAcute Bed", "Year-Round\nShelter Bed\n(Driftwood est.)",
-                "Warming\nCentre Bed"]
-    # Driftwood per-bed-night: $85,700/mo ÷ 30 days ÷ 40 beds ≈ $71/bed/night
+    """
+    Reference chart: cost per bed-night by care setting.
+
+    Hospital ICU is shown as TWO stacked bars (low $7k / high $10k).
+    Non-ICU and shelter/warming bars sit alongside for comparison.
+    """
     driftwood_per_bed_night = DRIFTWOOD_FIXED_MONTHLY / 30 / DRIFTWOOD_CAPACITY
     warming_per_bed_night   = WARMING_CENTRE_FIXED_MONTHLY / 30 / WARMING_CENTRE_CAPACITY
-    costs   = [COST_HOSPITAL_BED_DAY, driftwood_per_bed_night, warming_per_bed_night]
-    colours = ["#e74c3c", "#3498db", "#27ae60"]
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-    bars = ax.bar(settings, costs, color=colours, width=0.45)
-    for bar, cost in zip(bars, costs):
+    # ── Bar positions ─────────────────────────────────────────────────────────
+    # 0: ICU low  |  1: ICU high  |  2: Non-ICU  |  3: Driftwood  |  4: Warming
+    labels  = [
+        f"ICU Bed\n($7,000/night)",
+        f"ICU Bed\n($10,000/night)",
+        f"Non-ICU Bed\n(${COST_NON_ICU_BED_DAY:,}/night)",
+        f"Driftwood Shelter\nBed (${driftwood_per_bed_night:,.0f}/night)",
+        f"Warming Centre\nBed (${warming_per_bed_night:,.0f}/night)",
+    ]
+    values  = [
+        COST_ICU_BED_DAY_LOW,
+        COST_ICU_BED_DAY_HIGH,
+        COST_NON_ICU_BED_DAY,
+        driftwood_per_bed_night,
+        warming_per_bed_night,
+    ]
+    colours = ["#c0392b", "#e74c3c", "#e67e22", "#3498db", "#27ae60"]
+    x       = np.arange(len(labels))
+    w       = 0.55
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    # Draw ICU bars as one group with a bracket
+    bars = ax.bar(x, values, width=w, color=colours, alpha=0.88, zorder=3)
+
+    # Annotate each bar
+    for bar, val in zip(bars, values):
         ax.text(bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + 5,
-                f"${cost:,.0f}/night", ha='center', va='bottom',
-                fontsize=10, fontweight='bold')
+                bar.get_height() + 80,
+                f"${val:,.0f}", ha='center', va='bottom',
+                fontsize=9, fontweight='bold')
 
-    ratio_s = COST_HOSPITAL_BED_DAY / driftwood_per_bed_night
-    ratio_w = COST_HOSPITAL_BED_DAY / warming_per_bed_night
-    ax.text(0.97, 0.95,
-            f"Hospital is ~{ratio_s:.0f}× more costly than shelter\n"
-            f"Hospital is ~{ratio_w:.0f}× more costly than warming centre",
-            transform=ax.transAxes, ha='right', va='top', fontsize=9,
+    # Bracket linking the two ICU bars
+    y_bracket = COST_ICU_BED_DAY_HIGH * 1.08
+    ax.annotate("", xy=(x[1], y_bracket), xytext=(x[0], y_bracket),
+                arrowprops=dict(arrowstyle="<->", color="black", lw=1.5))
+    ax.text((x[0] + x[1]) / 2, y_bracket + 150,
+            "ICU range", ha='center', fontsize=8.5, color='black')
+
+    # Ratio callout box
+    ratio_icu_low_vs_shelter  = COST_ICU_BED_DAY_LOW  / driftwood_per_bed_night
+    ratio_icu_high_vs_shelter = COST_ICU_BED_DAY_HIGH / driftwood_per_bed_night
+    ratio_non_icu_vs_shelter  = COST_NON_ICU_BED_DAY  / driftwood_per_bed_night
+    ax.text(0.98, 0.97,
+            f"ICU is {ratio_icu_low_vs_shelter:.0f}–{ratio_icu_high_vs_shelter:.0f}× "
+            f"more costly than Driftwood shelter\n"
+            f"Non-ICU is {ratio_non_icu_vs_shelter:.0f}× more costly than Driftwood shelter",
+            transform=ax.transAxes, ha='right', va='top', fontsize=8.5,
             bbox=dict(boxstyle='round', facecolor='#fffbcc', alpha=0.9))
 
-    ax.set_ylim(0, max(costs) * 1.3)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=8.5)
     ax.set_ylabel("CAD per bed-night")
-    ax.set_title("Cost per Bed-Night by Care Setting — Powell River", fontsize=11)
-    ax.grid(axis='y', alpha=0.25)
+    ax.set_ylim(0, COST_ICU_BED_DAY_HIGH * 1.30)
+    ax.set_title(
+        "Cost per Bed-Night by Care Setting — qathet General Hospital & Powell River Shelter\n"
+        "(3 ICU beds + 39 non-ICU beds; Driftwood $1.6M/yr ÷ 40 beds ÷ 365 days)",
+        fontsize=10
+    )
+    ax.grid(axis='y', alpha=0.25, zorder=0)
+
+    # Legend patches
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor="#c0392b", alpha=0.88, label="ICU — low estimate ($7,000)"),
+        Patch(facecolor="#e74c3c", alpha=0.88, label="ICU — high estimate ($10,000)"),
+        Patch(facecolor="#e67e22", alpha=0.88, label=f"Non-ICU (${COST_NON_ICU_BED_DAY:,})"),
+        Patch(facecolor="#3498db", alpha=0.88, label="Driftwood shelter bed"),
+        Patch(facecolor="#27ae60", alpha=0.88, label="Warming centre bed"),
+    ]
+    ax.legend(handles=legend_elements, fontsize=8, loc='upper left')
 
     plt.tight_layout()
     plt.savefig("outputs/powell_river_cost_per_night.png", dpi=150, bbox_inches='tight')
@@ -657,8 +841,11 @@ if __name__ == "__main__":
     print("=" * 60)
     print("Powell River Homeless ED Utilization ABM")
     print(f"  Hospital capacity : {HOSPITAL_CAPACITY} beds (qathet General)")
-    print(f"  Start             : April 2026")
-    print(f"  Duration          : {SIM_MONTHS} months")
+    print(f"    ICU beds        : {HOSPITAL_ICU_BEDS} @ ${COST_ICU_BED_DAY_LOW:,}–${COST_ICU_BED_DAY_HIGH:,}/day")
+    print(f"    Non-ICU beds    : {HOSPITAL_NON_ICU_BEDS} @ ${COST_NON_ICU_BED_DAY:,}/day")
+    print(f"    Blended cost    : ${COST_HOSPITAL_BED_DAY:,}/day (used in simulation)")
+    print(f"  Driftwood shelter : $1.6M/yr → ${DRIFTWOOD_FIXED_MONTHLY:,}/month")
+    print(f"  Start             : April 2026  |  Duration: {SIM_MONTHS} months")
     print(f"  Initial population: {INITIAL_POPULATION}")
     print(f"  Admission prob    : {ADMISSION_PROB:.0%}  ← SWAP with Z59/(NFA+Z59)")
     print(f"  LOS mean          : {LOS_MEAN_DAYS} days  ← SWAP with real data")
@@ -667,7 +854,9 @@ if __name__ == "__main__":
     scenarios = run_all_scenarios(months=SIM_MONTHS, seed=RNG_SEED)
 
     print_summary(scenarios)
+    print_breakeven(scenarios)
     plot_cost_per_night()
     plot_main(scenarios, months=SIM_MONTHS)
     plot_cost_breakdown(scenarios, months=SIM_MONTHS)
+    plot_breakeven(scenarios, months=SIM_MONTHS)
     plot_demographics(scenarios)
