@@ -59,7 +59,7 @@ ARRIVAL_LAMBDA      = 11          # Poisson mean: homeless individuals arriving 
 
 # ── Admission process ─────────────────────────────────────────────────────────
 ADMISSION_LAMBDA    = 10          # Poisson pool size n for Binomial draw
-ADMISSION_PROB      = 0.10        # Binomial p  ← SWAP with Z59/(NFA+Z59) from real data
+ADMISSION_PROB      = 0.10       # Binomial p  ← SWAP with Z59/(NFA+Z59) from real data
 
 # ── Length of stay ────────────────────────────────────────────────────────────
 LOS_MEAN_DAYS       = 15.4        # ← SWAP with mean(discharge_date - admission_date)
@@ -69,14 +69,15 @@ LOS_SD_DAYS         = 2.0         # ← SWAP with std(discharge_date - admission
 INITIAL_POPULATION  = 80          # ← SWAP with confirmed PiT count when available
 
 # ── Open-population dynamics ──────────────────────────────────────────────────
-NEW_HOMELESS_LAMBDA         = 8   # Poisson mean: new entries into homelessness/month
-                                  # ← SWAP with local inflow estimates
-MONTHLY_MORTALITY_RATE      = 0.005  # ~6% annual; elevated vs general pop  ← SWAP
-MONTHLY_SPONTANEOUS_EXIT    = 0.015  # ~18% annual housed/left area          ← SWAP
-
+# ── Open-population dynamics ──────────────────────────────────────────────────
+NEW_HOMELESS_LAMBDA      = 0.167     # 2 new entries/year ÷ 12 months (Annu's calc)
+MONTHLY_MORTALITY_RATE   = 0.003125  # 3 deaths/year ÷ 80 pop (Annu's calc)
+MONTHLY_SPONTANEOUS_EXIT = 0.015     # ~18% annual housed/left area  ← SWAP
 # ── Readmissions ──────────────────────────────────────────────────────────────
-READMISSION_PROB            = 0.22   # prob of readmission per eligible month ← SWAP
-READMISSION_RISK_MONTHS     = 2      # months post-discharge at elevated risk
+# Readmission: 17.1% at 30 days, 27.1% at 90 days (literature)
+# Monthly p back-calculated from 90-day cumulative: 1-(1-0.271)^(1/3) ≈ 0.099
+READMISSION_PROB        = 0.099
+READMISSION_RISK_MONTHS = 3
 
 # ── Seasonal parameters ───────────────────────────────────────────────────────
 WINTER_MONTHS               = {11, 12, 1, 2, 3}
@@ -860,3 +861,7 @@ if __name__ == "__main__":
     plot_cost_breakdown(scenarios, months=SIM_MONTHS)
     plot_breakeven(scenarios, months=SIM_MONTHS)
     plot_demographics(scenarios)
+
+baseline_admits = sum(scenarios["Baseline\n(no shelter)"]["monthly_admissions"])
+driftwood_admits = sum(scenarios["Driftwood Opens\n(40 beds, Apr 2026)"]["monthly_admissions"])
+print(f"Admissions avoided per month: {(baseline_admits - driftwood_admits) / SIM_MONTHS:.1f}")

@@ -1,39 +1,40 @@
 """
 Agent-Based Model: Homeless Population & Emergency Department Utilization
-Powell River (qathet), BC
+Sechelt / shíshálh Nation, BC (including Gibsons Warming Centre)
 =========================================================================
 
 Real-world context
 ------------------
-  Hospital     : qathet General Hospital — 42 acute beds
-  Shelter hist : Joyce Ave (20 beds) CLOSED March 2025
-                 → zero shelter beds from March 2025 onward
+  Hospital     : shíshálh Hospital, Sechelt — 63 acute beds (5 ICU + 58 non-ICU)
+  Warming Ctr  : Gibsons Warming Centre — 20 spaces, October–April (all scenarios)
+  Rain City    : Rain City shelter, 25 permanent beds + 10 additional Oct–Apr
+  Population   : 129 individuals (confirmed)
   Sim start    : April 2026
-  Driftwood    : 40-bed shelter at 7104 Barnet St opens April 2026 (month 1)
-  Population   : 80 homeless individuals (2023 PiT count)
 
 Scenarios
 ---------
-  1. Baseline          — no shelter (reflects post-March 2025 reality)
-  2. Driftwood Opens   — 40-bed year-round shelter active from month 1 (April 2026)
-  3. Double Shelter    — Driftwood + additional 40-bed shelter (hypothetical expansion)
-  4. Warming Centre    — Driftwood + 20-bed warming centre (Oct–Apr only)
+  1. Baseline          — Rain City 25 beds (+ 10 Oct-Apr) + Gibsons warming centre
+  2. Make 10 Permanent — Rain City 35 beds year-round + Gibsons warming centre
+  3. Expand to 35+10   — Rain City 35 beds + 10 additional Oct-Apr + Gibsons warming centre
+  4. Double Shelter    — Rain City 25+10 (Oct-Apr) + second identical shelter 25+10 (Oct-Apr)
+                         + Gibsons warming centre
 
 Hospital overflow
 -----------------
-  Hard capacity = 42 beds.
-  When occupancy >= 42, new admissions are still recorded but flagged as overflow
-  (i.e. the hospital is over capacity — tracked separately for reporting).
+  Hard capacity = 63 beds.
+  When occupancy >= 63, new admissions are still recorded but flagged as overflow.
 
-Plug-in points flagged with  # ← SWAP  throughout.
-All tunable parameters are in the PARAMETERS block only.
+Readmission (two-phase, literature-sourced)
+-------------------------------------------
+  Month 1 (0-30 days) : 17.1% readmission probability
+  Months 2-3 (31-90d) : 6.4%/month back-calculated so cumulative ~27.1% at 90 days
 """
 
 from __future__ import annotations
 
+import os
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 import matplotlib.patches as mpatches
 from collections import Counter
 from dataclasses import dataclass
@@ -42,90 +43,125 @@ from typing import Optional
 
 
 # =============================================================================
-# PARAMETERS  ←  edit here; nowhere else
+# PARAMETERS  <-- edit here; nowhere else
 # =============================================================================
 
-# ── Simulation ────────────────────────────────────────────────────────────────
-SIM_MONTHS          = 24          # months to simulate
-SIM_START_MONTH     = 4           # April (month 1 of sim = April 2026)
+# Simulation
+SIM_MONTHS          = 24
+SIM_START_MONTH     = 4           # April 2026
 RNG_SEED            = 42
 
-# ── Hospital ──────────────────────────────────────────────────────────────────
-HOSPITAL_CAPACITY   = 42          # qathet General Hospital acute beds
+# Hospital — shíshálh Hospital, Sechelt
+HOSPITAL_CAPACITY   = 63          # total acute beds
+HOSPITAL_ICU_BEDS   = 5
+HOSPITAL_NON_ICU_BEDS = 58
 
-# ── Arrival process ───────────────────────────────────────────────────────────
-ARRIVAL_LAMBDA      = 11          # Poisson mean: homeless individuals arriving at ED/month
-                                  # ← SWAP with real ED visit counts once data arrives
+# Arrival process
+ARRIVAL_LAMBDA      = 11          # Poisson mean: ED arrivals/month  <- SWAP
 
-# ── Admission process ─────────────────────────────────────────────────────────
+# Admission process
 ADMISSION_LAMBDA    = 10          # Poisson pool size n for Binomial draw
-ADMISSION_PROB      = 0.10        # Binomial p  ← SWAP with Z59/(NFA+Z59) from real data
+ADMISSION_PROB      = 0.10        # Binomial p  <- SWAP with Z59/(NFA+Z59)
 
-# ── Length of stay ────────────────────────────────────────────────────────────
-LOS_MEAN_DAYS       = 15.4        # ← SWAP with mean(discharge_date - admission_date)
-LOS_SD_DAYS         = 2.0         # ← SWAP with std(discharge_date - admission_date)
+# Length of stay
+LOS_MEAN_DAYS       = 15.4        # <- SWAP with mean(discharge - admission)
+LOS_SD_DAYS         = 2.0         # <- SWAP with std(discharge - admission)
 
-# ── Starting population ───────────────────────────────────────────────────────
-INITIAL_POPULATION  = 80          # ← SWAP with confirmed PiT count when available
+# Starting population
+INITIAL_POPULATION  = 129         # confirmed count
 
-# ── Open-population dynamics ──────────────────────────────────────────────────
-NEW_HOMELESS_LAMBDA         = 8   # Poisson mean: new entries into homelessness/month
-                                  # ← SWAP with local inflow estimates
-MONTHLY_MORTALITY_RATE      = 0.005  # ~6% annual; elevated vs general pop  ← SWAP
-MONTHLY_SPONTANEOUS_EXIT    = 0.015  # ~18% annual housed/left area          ← SWAP
+# Open-population dynamics
+NEW_HOMELESS_LAMBDA      = 0.167     # ~2 new entries/year / 12 months
+MONTHLY_MORTALITY_RATE   = 0.003125  # ~3 deaths/year / pop
+MONTHLY_SPONTANEOUS_EXIT = 0.015     # ~18% annual housed/left area  <- SWAP
 
-# ── Readmissions ──────────────────────────────────────────────────────────────
-READMISSION_PROB            = 0.22   # prob of readmission per eligible month ← SWAP
-READMISSION_RISK_MONTHS     = 2      # months post-discharge at elevated risk
+# Readmissions (two-phase, literature-sourced)
+READMISSION_PROB_30DAY  = 0.171
+READMISSION_PROB_90DAY  = 0.064
+READMISSION_RISK_MONTHS = 3
 
-# ── Seasonal parameters ───────────────────────────────────────────────────────
-WINTER_MONTHS               = {11, 12, 1, 2, 3}
-SEASONAL_ADMISSION_BOOST    = 0.05   # extra admission prob in winter months
+# Seasonal parameters
+WINTER_MONTHS            = {11, 12, 1, 2, 3}
+SEASONAL_ADMISSION_BOOST = 0.05
 
-# ── Demographics ──────────────────────────────────────────────────────────────
-# ← SWAP with real age/gender from qathet hospital data
+# Demographics  <- SWAP with real data
 GENDER_PROBS = {"Male": 0.70, "Female": 0.26, "Other": 0.04}
 AGE_GROUPS   = ["18-29", "30-44", "45-59", "60+"]
 AGE_PROBS    = [0.20,    0.35,    0.30,    0.15]
 
-# ── Cost parameters ───────────────────────────────────────────────────────────
-COST_HOSPITAL_BED_DAY           = 1_500   # CAD; BC acute-care bed-day (CIHI estimate)
+# Hospital costs (same rates as before)
+COST_ICU_BED_DAY_LOW   = 7_000
+COST_ICU_BED_DAY_HIGH  = 10_000
+COST_NON_ICU_BED_DAY   = 1_100
 
-# Driftwood / year-round shelter (based on Sechelt RainCity ~$900k/yr for 35 beds)
-# Scaled to 40 beds → ~$1.03M/yr → ~$85,700/month total
-DRIFTWOOD_CAPACITY              = 40      # beds
-DRIFTWOOD_FIXED_MONTHLY         = 85_700  # CAD; total operating cost/month
-                                          # ← SWAP with actual BC Housing contract value
+_ICU_MID              = (COST_ICU_BED_DAY_LOW + COST_ICU_BED_DAY_HIGH) / 2
+COST_HOSPITAL_BED_DAY = round(
+    (HOSPITAL_ICU_BEDS * _ICU_MID + HOSPITAL_NON_ICU_BEDS * COST_NON_ICU_BED_DAY)
+    / (HOSPITAL_ICU_BEDS + HOSPITAL_NON_ICU_BEDS)
+)  # blended $/day
 
-# Additional 40-bed shelter (same cost structure as Driftwood)
-ADDITIONAL_SHELTER_CAPACITY     = 40
-ADDITIONAL_SHELTER_FIXED_MONTHLY = 85_700
+# ---------------------------------------------------------------------------
+# Rain City Shelter costs
+# ---------------------------------------------------------------------------
+RAINCITY_ANNUAL_COST         = 1_474_155.52
+RAINCITY_FIXED_MONTHLY       = RAINCITY_ANNUAL_COST / 12   # ~$122,846/month @ 25 beds
+# Cost is pro-rated by active beds each month:
+#   e.g. 35 beds year-round  = (35/25) x $122,846 = ~$172,384/month
+#        25 perm + 10 winter  = (35/25) x $122,846 in Oct-Apr, baseline otherwise
+RAINCITY_PERM_BEDS           = 25     # baseline reference bed count for pro-rating
+RAINCITY_WINTER_EXTRA_BEDS   = 10     # Oct-Apr only (baseline & scenario 4)
+RAINCITY_WINTER_MONTHS       = {10, 11, 12, 1, 2, 3, 4}
 
-# Warming centre (Oct–Apr; 20 beds; lower cost than year-round shelter)
-WARMING_CENTRE_CAPACITY         = 20
-WARMING_CENTRE_MONTHS           = {10, 11, 12, 1, 2, 3, 4}   # Oct–Apr
-WARMING_CENTRE_FIXED_MONTHLY    = 40_000  # CAD/month while open
-                                          # ← SWAP with actual contract value
+# Scenario 2 — make the 10 extra beds permanent (35 year-round)
+# No extra cost assumed (already within facility capacity)
+RAINCITY_PERM_35_BEDS        = 35
 
-# ── Shelter diversion effects ─────────────────────────────────────────────────
-# How much each shelter type reduces ED pressure
-# These are conservative estimates; ← SWAP with literature values or calibrated data
+# Scenario 3 — expand to 35 permanent + 10 winter extra
+RAINCITY_EXPAND_PERM_BEDS    = 35
+RAINCITY_EXPAND_WINTER_BEDS  = 10
 
-# Year-round shelter (Driftwood)
-SHELTER_ARRIVAL_REDUCTION       = 0.25   # 25% of ED arrivals diverted
-SHELTER_ADMISSION_REDUCTION     = 0.05   # absolute drop in admission probability
-SHELTER_READMISSION_REDUCTION   = 0.08   # absolute drop in readmission probability
-SHELTER_EXIT_BOOST              = 0.01   # extra monthly housing exit probability
+# Scenario 4 — second identical Rain City shelter (25 perm + 10 Oct-Apr)
+SECOND_SHELTER_ANNUAL_COST   = 1_474_155.52
+SECOND_SHELTER_MONTHLY       = SECOND_SHELTER_ANNUAL_COST / 12
+SECOND_SHELTER_PERM_BEDS     = 25
+SECOND_SHELTER_WINTER_BEDS   = 10
 
-# Second 40-bed shelter (additive on top of Driftwood)
-EXTRA_SHELTER_ARRIVAL_REDUCTION     = 0.10   # additional 10% diversion
-EXTRA_SHELTER_ADMISSION_REDUCTION   = 0.02
-EXTRA_SHELTER_READMISSION_REDUCTION = 0.03
+# ---------------------------------------------------------------------------
+# Gibsons Warming Centre (present in ALL scenarios)
+# ---------------------------------------------------------------------------
+WARMING_CENTRE_SPACES        = 20
+WARMING_CENTRE_MONTHS        = {10, 11, 12, 1, 2, 3, 4}   # Oct–Apr
+WARMING_CENTRE_FIXED_MONTHLY = 40_000    # <- SWAP with actual contract value
 
-# Warming centre (winter-only, smaller effect)
-WARMING_ARRIVAL_REDUCTION       = 0.08   # 8% additional winter diversion
-WARMING_ADMISSION_REDUCTION     = 0.03
-WARMING_READMISSION_REDUCTION   = 0.04
+# ---------------------------------------------------------------------------
+# Shelter diversion effects (kept from prior calibration — SWAP when real data available)
+# ---------------------------------------------------------------------------
+# Rain City baseline (25 perm beds)
+SHELTER_ARRIVAL_REDUCTION       = 0.25
+SHELTER_ADMISSION_REDUCTION     = 0.05
+SHELTER_READMISSION_REDUCTION   = 0.08
+SHELTER_EXIT_BOOST              = 0.01
+
+# Incremental effect of extra (winter) beds at Rain City
+WINTER_EXTRA_ARRIVAL_REDUCTION      = 0.05
+WINTER_EXTRA_ADMISSION_REDUCTION    = 0.01
+WINTER_EXTRA_READMISSION_REDUCTION  = 0.02
+
+# Incremental effect of expansion to 35 permanent
+EXPAND_ARRIVAL_REDUCTION        = 0.10
+EXPAND_ADMISSION_REDUCTION      = 0.02
+EXPAND_READMISSION_REDUCTION    = 0.03
+
+# Second shelter (same size as Rain City)
+SECOND_SHELTER_ARRIVAL_REDUCTION     = 0.25
+SECOND_SHELTER_ADMISSION_REDUCTION   = 0.05
+SECOND_SHELTER_READMISSION_REDUCTION = 0.08
+SECOND_SHELTER_EXIT_BOOST            = 0.01
+
+# Warming centre (applied Oct–Apr in all scenarios)
+WARMING_ARRIVAL_REDUCTION     = 0.08
+WARMING_ADMISSION_REDUCTION   = 0.03
+WARMING_READMISSION_REDUCTION = 0.04
 
 
 # =============================================================================
@@ -165,15 +201,19 @@ class Agent:
         self.months_post_discharge   = 0
 
     def discharge(self, month: int):
-        self.state             = State.POST_DISCHARGE
-        self.discharge_month   = month
+        self.state                 = State.POST_DISCHARGE
+        self.discharge_month       = month
         self.months_post_discharge = 0
 
-    def house(self):  self.state = State.HOUSED
-    def die(self):    self.state = State.DECEASED
+    def house(self): self.state = State.HOUSED
+    def die(self):   self.state = State.DECEASED
+
+    def readmission_prob(self) -> float:
+        if self.months_post_discharge == 0:
+            return READMISSION_PROB_30DAY
+        return READMISSION_PROB_90DAY
 
     def update(self, current_month: int, days_in_month: int = 30) -> float:
-        """Advance one month. Returns bed-days consumed."""
         bed_days = 0.0
         if self.state is State.ADMITTED:
             days_used = min(self.remaining_days, days_in_month)
@@ -189,13 +229,13 @@ class Agent:
         return bed_days
 
     @property
-    def is_active(self)             -> bool: return self.state not in (State.HOUSED, State.DECEASED)
+    def is_active(self)              -> bool: return self.state not in (State.HOUSED, State.DECEASED)
     @property
-    def in_bed(self)                -> bool: return self.state is State.ADMITTED
+    def in_bed(self)                 -> bool: return self.state is State.ADMITTED
     @property
-    def eligible_new_admission(self)-> bool: return self.state is State.HOMELESS
+    def eligible_new_admission(self) -> bool: return self.state is State.HOMELESS
     @property
-    def eligible_readmission(self)  -> bool: return self.state is State.POST_DISCHARGE
+    def eligible_readmission(self)   -> bool: return self.state is State.POST_DISCHARGE
 
 
 # =============================================================================
@@ -203,51 +243,46 @@ class Agent:
 # =============================================================================
 
 def run_simulation(
-    months:               int   = SIM_MONTHS,
-    initial_agents:       int   = INITIAL_POPULATION,
-    arrival_lambda:       float = ARRIVAL_LAMBDA,
-    admission_lambda:     float = ADMISSION_LAMBDA,
-    admission_prob:       float = ADMISSION_PROB,
-    readmission_prob:     float = READMISSION_PROB,
-    los_mean:             float = LOS_MEAN_DAYS,
-    los_sd:               float = LOS_SD_DAYS,
-    seasonal:             bool  = True,
+    months:           int   = SIM_MONTHS,
+    initial_agents:   int   = INITIAL_POPULATION,
+    arrival_lambda:   float = ARRIVAL_LAMBDA,
+    admission_lambda: float = ADMISSION_LAMBDA,
+    admission_prob:   float = ADMISSION_PROB,
+    los_mean:         float = LOS_MEAN_DAYS,
+    los_sd:           float = LOS_SD_DAYS,
+    seasonal:         bool  = True,
     # Scenario flags
-    driftwood_open:       bool  = False,   # 40-bed year-round shelter from month 1
-    extra_shelter:        bool  = False,   # additional 40-bed shelter
-    warming_centre:       bool  = False,   # 20-bed warming centre Oct–Apr
-    seed:                 int   = RNG_SEED,
-    start_month:          int   = SIM_START_MONTH,
+    raincity_perm_beds:      int   = RAINCITY_PERM_BEDS,   # permanent year-round beds
+    raincity_winter_extra:   int   = RAINCITY_WINTER_EXTRA_BEDS,  # extra beds Oct-Apr
+    second_shelter:          bool  = False,
+    seed:             int   = RNG_SEED,
+    start_month:      int   = SIM_START_MONTH,
 ) -> dict:
 
     rng         = np.random.default_rng(seed)
     gender_keys = list(GENDER_PROBS.keys())
     gender_vals = list(GENDER_PROBS.values())
 
-    # ── Effective parameters ──────────────────────────────────────────────────
-    eff_exit_base  = MONTHLY_SPONTANEOUS_EXIT
-    eff_adm_base   = admission_prob
-    eff_readm_base = readmission_prob
-    eff_arr_lambda = arrival_lambda
+    # ---- Base diversion effects from Rain City permanent beds ----
+    # Scale linearly relative to the baseline 25-bed shelter
+    bed_scale = raincity_perm_beds / RAINCITY_PERM_BEDS
 
-    if driftwood_open:
-        eff_arr_lambda  *= (1 - SHELTER_ARRIVAL_REDUCTION)
-        eff_adm_base    -= SHELTER_ADMISSION_REDUCTION
-        eff_readm_base  -= SHELTER_READMISSION_REDUCTION
-        eff_exit_base   += SHELTER_EXIT_BOOST
+    eff_exit_base   = MONTHLY_SPONTANEOUS_EXIT + SHELTER_EXIT_BOOST * bed_scale
+    eff_adm_base    = admission_prob - SHELTER_ADMISSION_REDUCTION * bed_scale
+    eff_arr_lambda  = arrival_lambda * (1 - SHELTER_ARRIVAL_REDUCTION * bed_scale)
+    readm_reduction = SHELTER_READMISSION_REDUCTION * bed_scale
 
-    if extra_shelter:
-        eff_arr_lambda  *= (1 - EXTRA_SHELTER_ARRIVAL_REDUCTION)
-        eff_adm_base    -= EXTRA_SHELTER_ADMISSION_REDUCTION
-        eff_readm_base  -= EXTRA_SHELTER_READMISSION_REDUCTION
+    if second_shelter:
+        eff_arr_lambda  *= (1 - SECOND_SHELTER_ARRIVAL_REDUCTION)
+        eff_adm_base    -= SECOND_SHELTER_ADMISSION_REDUCTION
+        eff_exit_base   += SECOND_SHELTER_EXIT_BOOST
+        readm_reduction += SECOND_SHELTER_READMISSION_REDUCTION
 
-    eff_arr_lambda  = max(0.0, eff_arr_lambda)
-    eff_adm_base    = max(0.0, eff_adm_base)
-    eff_readm_base  = max(0.0, eff_readm_base)
+    eff_arr_lambda = max(0.0, eff_arr_lambda)
+    eff_adm_base   = max(0.0, eff_adm_base)
 
-    # ── Initialise population ─────────────────────────────────────────────────
-    agents   = []
-    next_id  = 0
+    agents  = []
+    next_id = 0
 
     def _new_agent(entry_month: int) -> Agent:
         nonlocal next_id
@@ -263,29 +298,53 @@ def run_simulation(
     for _ in range(initial_agents):
         agents.append(_new_agent(0))
 
-    # ── Monthly output lists ──────────────────────────────────────────────────
-    monthly_arrivals       = []
-    monthly_new_homeless   = []
-    monthly_admissions     = []
-    monthly_readmissions   = []
-    monthly_overflow       = []    # admissions that exceeded 42-bed capacity
-    monthly_discharges     = []
-    monthly_deaths         = []
-    monthly_exits          = []
-    monthly_occupancy      = []
-    monthly_pop_homeless   = []
-    monthly_bed_days       = []
-    monthly_cost_hospital  = []
-    monthly_cost_shelter   = []
-    monthly_cost_total     = []
+    monthly_arrivals      = []
+    monthly_new_homeless  = []
+    monthly_admissions    = []
+    monthly_readmissions  = []
+    monthly_overflow      = []
+    monthly_discharges    = []
+    monthly_deaths        = []
+    monthly_exits         = []
+    monthly_occupancy     = []
+    monthly_pop_homeless  = []
+    monthly_bed_days      = []
+    monthly_cost_hospital = []
+    monthly_cost_shelter  = []
+    monthly_cost_total    = []
 
     for sim_month in range(1, months + 1):
-        cal_month = ((start_month - 1 + sim_month - 1) % 12) + 1   # 1–12
-        is_winter = cal_month in WINTER_MONTHS
+        cal_month         = ((start_month - 1 + sim_month - 1) % 12) + 1
+        is_winter         = cal_month in WINTER_MONTHS
         is_warming_season = cal_month in WARMING_CENTRE_MONTHS
+        is_raincity_winter = cal_month in RAINCITY_WINTER_MONTHS
 
-        # ── 1. Advance all agents ─────────────────────────────────────────────
-        bed_days_this = 0.0
+        # Incremental effect of winter extra beds (when active)
+        arr_lambda_this = eff_arr_lambda
+        adm_extra       = 0.0
+        rdm_extra       = 0.0
+
+        if is_raincity_winter and raincity_winter_extra > 0:
+            extra_scale     = raincity_winter_extra / RAINCITY_WINTER_EXTRA_BEDS
+            arr_lambda_this *= (1 - WINTER_EXTRA_ARRIVAL_REDUCTION * extra_scale)
+            adm_extra       += WINTER_EXTRA_ADMISSION_REDUCTION * extra_scale
+            rdm_extra       += WINTER_EXTRA_READMISSION_REDUCTION * extra_scale
+
+        if second_shelter and is_raincity_winter:
+            arr_lambda_this *= (1 - WINTER_EXTRA_ARRIVAL_REDUCTION)
+            adm_extra       += WINTER_EXTRA_ADMISSION_REDUCTION
+            rdm_extra       += WINTER_EXTRA_READMISSION_REDUCTION
+
+        # Warming centre (all scenarios, Oct-Apr)
+        if is_warming_season:
+            arr_lambda_this *= (1 - WARMING_ARRIVAL_REDUCTION)
+            adm_extra       += WARMING_ADMISSION_REDUCTION
+            rdm_extra       += WARMING_READMISSION_REDUCTION
+
+        arr_lambda_this = max(0.0, arr_lambda_this)
+
+        # 1. Advance all agents
+        bed_days_this   = 0.0
         discharges_this = 0
         for ag in agents:
             if not ag.is_active:
@@ -295,50 +354,40 @@ def run_simulation(
             if ag.state is State.POST_DISCHARGE and ag.discharge_month == sim_month:
                 discharges_this += 1
 
-        # ── 2. Mortality ──────────────────────────────────────────────────────
+        # 2. Mortality
         deaths_this = 0
         for ag in agents:
             if ag.is_active and rng.random() < MONTHLY_MORTALITY_RATE:
                 ag.die()
                 deaths_this += 1
 
-        # ── 3. Spontaneous exits ──────────────────────────────────────────────
+        # 3. Spontaneous exits
         exits_this = 0
         for ag in agents:
             if ag.state is State.HOMELESS and rng.random() < eff_exit_base:
                 ag.house()
                 exits_this += 1
 
-        # ── 4. New homeless entries ───────────────────────────────────────────
+        # 4. New homeless entries
         n_new = rng.poisson(NEW_HOMELESS_LAMBDA)
         for _ in range(n_new):
             agents.append(_new_agent(sim_month))
 
-        # ── 5. ED arrivals ────────────────────────────────────────────────────
-        # Warming centre provides additional winter diversion on top of shelter effects
-        arr_lambda_this = eff_arr_lambda
-        if warming_centre and is_warming_season:
-            arr_lambda_this *= (1 - WARMING_ARRIVAL_REDUCTION)
-        arr_lambda_this = max(0.0, arr_lambda_this)
+        # 5. ED arrivals
         n_arrivals = rng.poisson(arr_lambda_this)
 
-        # ── 6. Effective admission probability ────────────────────────────────
-        p_adm = eff_adm_base
-        p_rdm = eff_readm_base
-        if warming_centre and is_warming_season:
-            p_adm = max(0.0, p_adm - WARMING_ADMISSION_REDUCTION)
-            p_rdm = max(0.0, p_rdm - WARMING_READMISSION_REDUCTION)
+        # 6. Effective admission probability
+        p_adm = max(0.0, eff_adm_base - adm_extra)
         if seasonal and is_winter:
             p_adm = min(1.0, p_adm + SEASONAL_ADMISSION_BOOST)
-            p_rdm = min(1.0, p_rdm + SEASONAL_ADMISSION_BOOST)
 
-        # ── 7. First-time admissions ──────────────────────────────────────────
-        current_occupancy  = sum(1 for ag in agents if ag.in_bed)
-        eligible_new       = [ag for ag in agents if ag.eligible_new_admission]
-        n_pool             = rng.poisson(admission_lambda)
-        n_admit_draw       = rng.binomial(n_pool, p_adm)
-        n_admit            = min(n_admit_draw, len(eligible_new))
-        n_overflow_this    = 0
+        # 7. First-time admissions
+        current_occupancy = sum(1 for ag in agents if ag.in_bed)
+        eligible_new      = [ag for ag in agents if ag.eligible_new_admission]
+        n_pool            = rng.poisson(admission_lambda)
+        n_admit_draw      = rng.binomial(n_pool, p_adm)
+        n_admit           = min(n_admit_draw, len(eligible_new))
+        n_overflow_this   = 0
 
         if n_admit > 0:
             chosen = rng.choice(len(eligible_new), size=n_admit, replace=False)
@@ -347,37 +396,48 @@ def run_simulation(
                 eligible_new[idx].admit(sim_month, los)
                 current_occupancy += 1
                 if current_occupancy > HOSPITAL_CAPACITY:
-                    n_overflow_this += 1   # flag: over 42-bed capacity
+                    n_overflow_this += 1
 
-        # ── 8. Readmissions ───────────────────────────────────────────────────
+        # 8. Readmissions — two-phase probability
         eligible_readm = [ag for ag in agents if ag.eligible_readmission]
         n_readmit = 0
         for ag in eligible_readm:
+            p_rdm = max(0.0, ag.readmission_prob() - readm_reduction - rdm_extra)
+            if seasonal and is_winter:
+                p_rdm = min(1.0, p_rdm + SEASONAL_ADMISSION_BOOST)
             if rng.random() < p_rdm:
                 los = max(1.0, rng.normal(los_mean, los_sd))
                 ag.admit(sim_month, los)
-                n_readmit      += 1
+                n_readmit += 1
                 current_occupancy += 1
                 if current_occupancy > HOSPITAL_CAPACITY:
                     n_overflow_this += 1
 
-        # ── 9. Shelter / warming-centre operating costs ───────────────────────
-        shelter_cost_this = 0.0
+        # 9. Shelter costs
+        # Rain City — pro-rated by active bed count this month:
+        #   permanent beds always on; winter extra beds only Oct-Apr
+        raincity_beds_active = raincity_perm_beds
+        if is_raincity_winter and raincity_winter_extra > 0:
+            raincity_beds_active += raincity_winter_extra
+        # Cost per bed = RAINCITY_FIXED_MONTHLY / RAINCITY_PERM_BEDS (baseline 25-bed rate)
+        shelter_cost_this = RAINCITY_FIXED_MONTHLY * (raincity_beds_active / RAINCITY_PERM_BEDS)
 
-        if driftwood_open:
-            shelter_cost_this += DRIFTWOOD_FIXED_MONTHLY
+        # Second shelter — also pro-rated by its active bed count
+        if second_shelter:
+            second_beds_active = SECOND_SHELTER_PERM_BEDS
+            if is_raincity_winter:
+                second_beds_active += SECOND_SHELTER_WINTER_BEDS
+            shelter_cost_this += SECOND_SHELTER_MONTHLY * (second_beds_active / SECOND_SHELTER_PERM_BEDS)
 
-        if extra_shelter:
-            shelter_cost_this += ADDITIONAL_SHELTER_FIXED_MONTHLY
-
-        if warming_centre and is_warming_season:
+        # Gibsons Warming Centre (all scenarios, Oct-Apr)
+        if is_warming_season:
             shelter_cost_this += WARMING_CENTRE_FIXED_MONTHLY
 
-        # ── 10. Collect tallies ───────────────────────────────────────────────
-        occupancy       = sum(1 for ag in agents if ag.in_bed)
-        pop_homeless    = sum(1 for ag in agents if ag.state is State.HOMELESS)
-        hospital_cost   = bed_days_this * COST_HOSPITAL_BED_DAY
-        total_cost      = hospital_cost + shelter_cost_this
+        # 10. Tallies
+        occupancy    = sum(1 for ag in agents if ag.in_bed)
+        pop_homeless = sum(1 for ag in agents if ag.state is State.HOMELESS)
+        hosp_cost    = bed_days_this * COST_HOSPITAL_BED_DAY
+        total_cost   = hosp_cost + shelter_cost_this
 
         monthly_arrivals.append(n_arrivals)
         monthly_new_homeless.append(n_new)
@@ -390,7 +450,7 @@ def run_simulation(
         monthly_occupancy.append(occupancy)
         monthly_pop_homeless.append(pop_homeless)
         monthly_bed_days.append(bed_days_this)
-        monthly_cost_hospital.append(hospital_cost)
+        monthly_cost_hospital.append(hosp_cost)
         monthly_cost_shelter.append(shelter_cost_this)
         monthly_cost_total.append(total_cost)
 
@@ -418,21 +478,21 @@ def run_simulation(
 # =============================================================================
 
 SCENARIO_DEFINITIONS = {
-    "Baseline\n(no shelter)": dict(
-        driftwood_open=False, extra_shelter=False, warming_centre=False),
-    "Driftwood Opens\n(40 beds, Apr 2026)": dict(
-        driftwood_open=True,  extra_shelter=False, warming_centre=False),
-    "Double Shelter\n(+40 beds)": dict(
-        driftwood_open=True,  extra_shelter=True,  warming_centre=False),
-    "Driftwood +\nWarming Centre\n(20 beds Oct–Apr)": dict(
-        driftwood_open=True,  extra_shelter=False, warming_centre=True),
+    "Baseline\n(RC 25 beds + 10 Oct-Apr\n+ Gibsons WC)": dict(
+        raincity_perm_beds=25,  raincity_winter_extra=10, second_shelter=False),
+    "Make 10 Extra Permanent\n(RC 35 beds year-round\n+ Gibsons WC)": dict(
+        raincity_perm_beds=35,  raincity_winter_extra=0,  second_shelter=False),
+    "Expand to 35 + 10 Winter\n(RC 35 perm + 10 Oct-Apr\n+ Gibsons WC)": dict(
+        raincity_perm_beds=35,  raincity_winter_extra=10, second_shelter=False),
+    "Double Shelter\n(RC 25+10 + 2nd Shelter 25+10\n+ Gibsons WC)": dict(
+        raincity_perm_beds=25,  raincity_winter_extra=10, second_shelter=True),
 }
 
 COLORS = {
-    "Baseline\n(no shelter)":                          "#e74c3c",
-    "Driftwood Opens\n(40 beds, Apr 2026)":            "#3498db",
-    "Double Shelter\n(+40 beds)":                      "#9b59b6",
-    "Driftwood +\nWarming Centre\n(20 beds Oct–Apr)":  "#27ae60",
+    "Baseline\n(RC 25 beds + 10 Oct-Apr\n+ Gibsons WC)":          "#e74c3c",
+    "Make 10 Extra Permanent\n(RC 35 beds year-round\n+ Gibsons WC)": "#3498db",
+    "Expand to 35 + 10 Winter\n(RC 35 perm + 10 Oct-Apr\n+ Gibsons WC)": "#9b59b6",
+    "Double Shelter\n(RC 25+10 + 2nd Shelter 25+10\n+ Gibsons WC)": "#27ae60",
 }
 
 def run_all_scenarios(months: int = SIM_MONTHS, seed: int = RNG_SEED) -> dict:
@@ -443,6 +503,18 @@ def run_all_scenarios(months: int = SIM_MONTHS, seed: int = RNG_SEED) -> dict:
 
 
 # =============================================================================
+# HELPERS
+# =============================================================================
+
+def _month_labels(months: int, start_month: int = SIM_START_MONTH) -> list:
+    names = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    return [
+        f"{names[((start_month - 1 + i) % 12)]} '{26 + ((start_month - 1 + i) // 12)}"
+        for i in range(months)
+    ]
+
+
+# =============================================================================
 # SUMMARY TABLE
 # =============================================================================
 
@@ -450,7 +522,7 @@ def print_summary(scenarios: dict):
     baseline_cost = sum(list(scenarios.values())[0]["monthly_cost_total"])
     w = 110
     print("\n" + "=" * w)
-    print(f"{'Scenario':<35} {'Admits':>7} {'Re-adm':>7} {'Overflow':>9} "
+    print(f"{'Scenario':<45} {'Admits':>7} {'Re-adm':>7} {'Overflow':>9} "
           f"{'Bed-Days':>10} {'Deaths':>7} "
           f"{'Hosp $M':>9} {'Shelter $M':>11} {'Total $M':>10} {'vs Baseline':>13}")
     print("=" * w)
@@ -466,162 +538,263 @@ def print_summary(scenarios: dict):
         t_cost   = sum(res["monthly_cost_total"])
         delta    = baseline_cost - t_cost
         dstr     = f"-${delta/1e6:.3f}M" if delta >= 0 else f"+${abs(delta)/1e6:.3f}M"
-        print(f"{label:<35} {admits:>7} {readmits:>7} {overflow:>9} "
+        print(f"{label:<45} {admits:>7} {readmits:>7} {overflow:>9} "
               f"{bed_days:>10.0f} {deaths:>7} "
               f"{h_cost/1e6:>9.3f} {s_cost/1e6:>11.3f} {t_cost/1e6:>10.3f} {dstr:>13}")
     print("=" * w + "\n")
 
 
 # =============================================================================
+# BREAK-EVEN ANALYSIS
+# =============================================================================
+
+def breakeven_analysis(scenarios: dict, months: int = SIM_MONTHS) -> dict:
+    baseline_hosp    = np.array(list(scenarios.values())[0]["monthly_cost_hospital"])
+    baseline_shelter = np.array(list(scenarios.values())[0]["monthly_cost_shelter"])
+    results = {}
+
+    for name, res in list(scenarios.items())[1:]:
+        scen_hosp    = np.array(res["monthly_cost_hospital"])
+        scen_shelter = np.array(res["monthly_cost_shelter"])
+        # Savings = reduction in hospital cost vs baseline
+        # Extra cost = additional shelter spend vs baseline
+        cum_hosp_savings  = np.cumsum(baseline_hosp - scen_hosp)
+        cum_shelter_extra = np.cumsum(scen_shelter - baseline_shelter)
+        net               = cum_hosp_savings - cum_shelter_extra
+
+        breakeven_month = next((t for t, n in enumerate(net, 1) if n >= 0), None)
+
+        results[name] = dict(
+            breakeven_month  = breakeven_month,
+            cum_savings      = cum_hosp_savings,
+            cum_shelter_cost = cum_shelter_extra,
+            net              = net,
+        )
+    return results
+
+
+def print_breakeven(scenarios: dict):
+    month_names = ["Jan","Feb","Mar","Apr","May","Jun",
+                   "Jul","Aug","Sep","Oct","Nov","Dec"]
+    be = breakeven_analysis(scenarios)
+
+    print("\n" + "=" * 72)
+    print("BREAK-EVEN ANALYSIS")
+    print("(Month when additional hospital savings exceed additional shelter costs)")
+    print("=" * 72)
+    print(f"{'Scenario':<50} {'Break-even':>12} {'Calendar':>12} {'Net saving at end':>18}")
+    print("-" * 72)
+
+    for name, data in be.items():
+        label   = name.replace("\n", " ")
+        bm      = data["breakeven_month"]
+        net_end = data["net"][-1]
+
+        if bm is not None:
+            cal_idx = (SIM_START_MONTH - 1 + bm - 1) % 12
+            yr      = 26 + (SIM_START_MONTH - 1 + bm - 1) // 12
+            cal_str = f"{month_names[cal_idx]} 20{yr}"
+            bm_str  = f"Month {bm}"
+        else:
+            cal_str = "Beyond window"
+            bm_str  = f"> {SIM_MONTHS} months"
+
+        net_str = f"${net_end/1e6:.3f}M" if net_end >= 0 else f"-${abs(net_end)/1e6:.3f}M"
+        print(f"{label:<50} {bm_str:>12} {cal_str:>12} {net_str:>18}")
+
+    print("=" * 72 + "\n")
+
+
+def plot_breakeven(scenarios: dict, months: int = SIM_MONTHS):
+    be     = breakeven_analysis(scenarios, months)
+    labels = _month_labels(months)
+    x      = np.arange(1, months + 1)
+
+    fig, ax = plt.subplots(figsize=(13, 5))
+    ax.axhline(0, color="black", lw=1.8, ls="--", label="Break-even line (net = $0)")
+
+    for name, data in be.items():
+        c   = COLORS[name]
+        net = data["net"] / 1e6
+        ax.plot(x, net, color=c, lw=2.5, marker="o", ms=3.5,
+                label=name.replace("\n", " "))
+        bm = data["breakeven_month"]
+        if bm is not None:
+            ax.axvline(bm, color=c, lw=1.2, ls=":", alpha=0.7)
+            ax.annotate(
+                f"Month {bm}",
+                xy=(bm, 0),
+                xytext=(bm + 0.4, max(data["net"][min(bm, months-1)] / 1e6 * 0.4, 0.03)),
+                fontsize=7.5, color=c, fontweight="bold",
+                arrowprops=dict(arrowstyle="->", color=c, lw=1),
+            )
+
+    ax.set_xticks(x[::3])
+    ax.set_xticklabels(labels[::3], rotation=35, ha="right", fontsize=7.5)
+    ax.set_ylabel("Cumulative Net Saving vs Baseline (M CAD)\n"
+                  "[additional hospital savings minus additional shelter costs]")
+    ax.set_title(
+        "Break-Even Analysis — When Do Additional Shelter Investments Pay For Themselves?\n"
+        "Positive = additional shelter spending more than offset by hospital savings",
+        fontsize=10,
+    )
+    ax.legend(fontsize=7.5)
+    ax.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig("outputs/sechelt_breakeven.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("Saved: outputs/sechelt_breakeven.png")
+
+
+# =============================================================================
 # PLOTTING
 # =============================================================================
 
-def _month_labels(months: int, start_month: int = SIM_START_MONTH) -> list[str]:
-    """Generate 'Apr 26', 'May 26' … labels for the x-axis."""
-    month_names = ["Jan","Feb","Mar","Apr","May","Jun",
-                   "Jul","Aug","Sep","Oct","Nov","Dec"]
-    labels = []
-    for i in range(months):
-        cal = ((start_month - 1 + i) % 12)
-        yr  = 26 + ((start_month - 1 + i) // 12)
-        labels.append(f"{month_names[cal]} '{yr}")
-    return labels
-
-
 def plot_main(scenarios: dict, months: int = SIM_MONTHS):
-    """4-panel summary: occupancy, admissions, overflow, cumulative cost."""
-    labels     = _month_labels(months)
-    x          = np.arange(months)
-    tick_every = 3
+    labels = _month_labels(months)
+    x      = np.arange(months)
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
     axes      = axes.flatten()
 
     panels = [
-        ("monthly_occupancy",    "Hospital Occupancy — End of Month",      "# Beds Occupied"),
-        ("monthly_admissions",   "Monthly Admissions (first-time)",         "# Admissions"),
-        ("monthly_overflow",     "Monthly Overflow Events\n(above 42-bed capacity)", "# Overflow Admissions"),
+        ("monthly_occupancy",  "Hospital Occupancy — End of Month",                "# Beds Occupied"),
+        ("monthly_admissions", "Monthly Admissions (first-time)",                   "# Admissions"),
+        ("monthly_overflow",   f"Monthly Overflow Events\n(above {HOSPITAL_CAPACITY}-bed capacity)", "# Overflow Admissions"),
     ]
 
     for ax, (key, title, ylabel) in zip(axes[:3], panels):
         for name, res in scenarios.items():
             ax.plot(x, res[key], color=COLORS[name], marker='o', ms=3.5,
                     label=name.replace("\n", " "))
-        # Hospital capacity line on occupancy chart
         if key == "monthly_occupancy":
             ax.axhline(HOSPITAL_CAPACITY, color='black', ls='--', lw=1.2,
                        label=f"Capacity ({HOSPITAL_CAPACITY} beds)")
         ax.set_title(title, fontsize=10)
         ax.set_ylabel(ylabel)
-        ax.set_xticks(x[::tick_every])
-        ax.set_xticklabels(labels[::tick_every], rotation=35, ha='right', fontsize=7)
-        ax.legend(fontsize=7)
+        ax.set_xticks(x[::3])
+        ax.set_xticklabels(labels[::3], rotation=35, ha='right', fontsize=7)
+        ax.legend(fontsize=6.5)
         ax.grid(alpha=0.25)
 
-    # ── Cumulative cost ───────────────────────────────────────────────────────
     ax4 = axes[3]
     for name, res in scenarios.items():
         ax4.plot(x, np.cumsum(res["monthly_cost_total"]) / 1e6,
                  color=COLORS[name], lw=2.5, label=name.replace("\n", " "))
     ax4.set_title("Cumulative Total Cost (Hospital + Shelter)", fontsize=10)
     ax4.set_ylabel("Cumulative Cost (M CAD)")
-    ax4.set_xticks(x[::tick_every])
-    ax4.set_xticklabels(labels[::tick_every], rotation=35, ha='right', fontsize=7)
-    ax4.legend(fontsize=7)
+    ax4.set_xticks(x[::3])
+    ax4.set_xticklabels(labels[::3], rotation=35, ha='right', fontsize=7)
+    ax4.legend(fontsize=6.5)
     ax4.grid(alpha=0.25)
 
     fig.suptitle(
-        "qathet General Hospital — Homeless ED Utilization ABM\n"
-        "Powell River, BC  |  Simulation starts April 2026",
-        fontsize=13, fontweight='bold'
+        "shíshálh Hospital — Homeless ED Utilization ABM\n"
+        "Sechelt, BC  |  Simulation starts April 2026  |  Rain City Shelter + Gibsons Warming Centre",
+        fontsize=12, fontweight='bold'
     )
     plt.tight_layout()
-    plt.savefig("/mnt/user-data/outputs/powell_river_main.png", dpi=150, bbox_inches='tight')
+    plt.savefig("outputs/sechelt_main.png", dpi=150, bbox_inches='tight')
     plt.show()
-    print("Saved: powell_river_main.png")
+    print("Saved: outputs/sechelt_main.png")
 
 
 def plot_cost_breakdown(scenarios: dict, months: int = SIM_MONTHS):
-    """Stacked bar: cumulative hospital vs shelter cost per scenario."""
-    names     = [n.replace("\n", " ") for n in scenarios]
-    hosp_cum  = [sum(s["monthly_cost_hospital"]) / 1e6 for s in scenarios.values()]
-    shlt_cum  = [sum(s["monthly_cost_shelter"])  / 1e6 for s in scenarios.values()]
-    x         = np.arange(len(names))
-    w         = 0.5
+    names    = [n.replace("\n", " ") for n in scenarios]
+    hosp_cum = [sum(s["monthly_cost_hospital"]) / 1e6 for s in scenarios.values()]
+    shlt_cum = [sum(s["monthly_cost_shelter"])  / 1e6 for s in scenarios.values()]
+    x        = np.arange(len(names))
 
-    fig, ax = plt.subplots(figsize=(11, 5))
-    bars_h  = ax.bar(x, hosp_cum, w, label="Hospital bed-day costs", color="#e74c3c", alpha=0.88)
-    bars_s  = ax.bar(x, shlt_cum, w, bottom=hosp_cum,
-                     label="Shelter / Warming-centre operating costs", color="#3498db", alpha=0.88)
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.bar(x, hosp_cum, 0.5, label="Hospital bed-day costs",              color="#e74c3c", alpha=0.88)
+    ax.bar(x, shlt_cum, 0.5, bottom=hosp_cum,
+           label="Shelter / Warming-centre costs", color="#3498db", alpha=0.88)
 
     baseline_total = hosp_cum[0] + shlt_cum[0]
     for i, (h, s) in enumerate(zip(hosp_cum, shlt_cum)):
-        total   = h + s
-        saving  = baseline_total - total
-        label   = f"${total:.2f}M"
-        if saving > 0:
-            label += f"\n(saves ${saving:.2f}M)"
-        ax.text(i, total + 0.02, label, ha='center', va='bottom', fontsize=8.5, fontweight='bold')
+        total  = h + s
+        saving = baseline_total - total
+        lbl    = f"${total:.2f}M" + (f"\n(saves ${saving:.2f}M)" if saving > 0 else "")
+        ax.text(i, total + 0.02, lbl, ha='center', va='bottom', fontsize=8, fontweight='bold')
 
     ax.axhline(baseline_total, color='grey', ls='--', lw=1, alpha=0.6, label="Baseline total")
     ax.set_xticks(x)
-    ax.set_xticklabels(names, fontsize=8)
+    ax.set_xticklabels(names, fontsize=7.5)
     ax.set_ylabel("Cumulative Cost (M CAD)")
-    ax.set_title(f"Cumulative Cost Breakdown Over {months} Months — Powell River ABM", fontsize=11)
+    ax.set_title(f"Cumulative Cost Breakdown Over {months} Months — Sechelt ABM", fontsize=11)
     ax.legend(fontsize=8)
     ax.grid(axis='y', alpha=0.25)
-
     plt.tight_layout()
-    plt.savefig("/mnt/user-data/outputs/powell_river_cost_breakdown.png", dpi=150, bbox_inches='tight')
+    plt.savefig("outputs/sechelt_cost_breakdown.png", dpi=150, bbox_inches='tight')
     plt.show()
-    print("Saved: powell_river_cost_breakdown.png")
+    print("Saved: outputs/sechelt_cost_breakdown.png")
 
 
 def plot_cost_per_night():
-    """Reference chart: cost per night by care setting."""
-    settings = ["Hospital\nAcute Bed", "Year-Round\nShelter Bed\n(Driftwood est.)",
-                "Warming\nCentre Bed"]
-    # Driftwood per-bed-night: $85,700/mo ÷ 30 days ÷ 40 beds ≈ $71/bed/night
-    driftwood_per_bed_night = DRIFTWOOD_FIXED_MONTHLY / 30 / DRIFTWOOD_CAPACITY
-    warming_per_bed_night   = WARMING_CENTRE_FIXED_MONTHLY / 30 / WARMING_CENTRE_CAPACITY
-    costs   = [COST_HOSPITAL_BED_DAY, driftwood_per_bed_night, warming_per_bed_night]
-    colours = ["#e74c3c", "#3498db", "#27ae60"]
+    raincity_pbn = RAINCITY_FIXED_MONTHLY / 30 / RAINCITY_PERM_BEDS
+    warming_pbn  = WARMING_CENTRE_FIXED_MONTHLY / 30 / WARMING_CENTRE_SPACES
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-    bars = ax.bar(settings, costs, color=colours, width=0.45)
-    for bar, cost in zip(bars, costs):
-        ax.text(bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + 5,
-                f"${cost:,.0f}/night", ha='center', va='bottom',
-                fontsize=10, fontweight='bold')
+    labels  = [
+        "ICU Bed\n($7,000/night)", "ICU Bed\n($10,000/night)",
+        f"Non-ICU Bed\n(${COST_NON_ICU_BED_DAY:,}/night)",
+        f"Rain City Shelter\nBed (${raincity_pbn:,.0f}/night)",
+        f"Gibsons Warming\nCentre (${warming_pbn:,.0f}/night)",
+    ]
+    values  = [COST_ICU_BED_DAY_LOW, COST_ICU_BED_DAY_HIGH,
+               COST_NON_ICU_BED_DAY, raincity_pbn, warming_pbn]
+    colours = ["#c0392b","#e74c3c","#e67e22","#3498db","#27ae60"]
+    x       = np.arange(len(labels))
 
-    ratio_s = COST_HOSPITAL_BED_DAY / driftwood_per_bed_night
-    ratio_w = COST_HOSPITAL_BED_DAY / warming_per_bed_night
-    ax.text(0.97, 0.95,
-            f"Hospital is ~{ratio_s:.0f}× more costly than shelter\n"
-            f"Hospital is ~{ratio_w:.0f}× more costly than warming centre",
-            transform=ax.transAxes, ha='right', va='top', fontsize=9,
+    fig, ax = plt.subplots(figsize=(12, 5))
+    bars    = ax.bar(x, values, width=0.55, color=colours, alpha=0.88, zorder=3)
+
+    for bar, val in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 80,
+                f"${val:,.0f}", ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+    y_b = COST_ICU_BED_DAY_HIGH * 1.08
+    ax.annotate("", xy=(x[1], y_b), xytext=(x[0], y_b),
+                arrowprops=dict(arrowstyle="<->", color="black", lw=1.5))
+    ax.text((x[0]+x[1])/2, y_b+150, "ICU range", ha='center', fontsize=8.5)
+
+    ax.text(0.98, 0.97,
+            f"ICU is {COST_ICU_BED_DAY_LOW/raincity_pbn:.0f}-"
+            f"{COST_ICU_BED_DAY_HIGH/raincity_pbn:.0f}x more costly than Rain City\n"
+            f"Non-ICU is {COST_NON_ICU_BED_DAY/raincity_pbn:.0f}x more costly than Rain City",
+            transform=ax.transAxes, ha='right', va='top', fontsize=8.5,
             bbox=dict(boxstyle='round', facecolor='#fffbcc', alpha=0.9))
 
-    ax.set_ylim(0, max(costs) * 1.3)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=8.5)
     ax.set_ylabel("CAD per bed-night")
-    ax.set_title("Cost per Bed-Night by Care Setting — Powell River", fontsize=11)
-    ax.grid(axis='y', alpha=0.25)
-
+    ax.set_ylim(0, COST_ICU_BED_DAY_HIGH * 1.30)
+    ax.set_title(
+        "Cost per Bed-Night by Care Setting — shíshálh Hospital & Rain City Shelter, Sechelt\n"
+        f"(5 ICU + 58 non-ICU beds; Rain City ${RAINCITY_ANNUAL_COST:,.2f}/yr / {RAINCITY_PERM_BEDS} beds)",
+        fontsize=10
+    )
+    ax.grid(axis='y', alpha=0.25, zorder=0)
+    ax.legend(handles=[
+        mpatches.Patch(facecolor=c, alpha=0.88, label=l)
+        for c, l in zip(colours, [
+            "ICU low ($7,000)", "ICU high ($10,000)",
+            f"Non-ICU (${COST_NON_ICU_BED_DAY:,})",
+            "Rain City shelter", "Gibsons Warming Centre"])
+    ], fontsize=8, loc='upper left')
     plt.tight_layout()
-    plt.savefig("/mnt/user-data/outputs/powell_river_cost_per_night.png", dpi=150, bbox_inches='tight')
+    plt.savefig("outputs/sechelt_cost_per_night.png", dpi=150, bbox_inches='tight')
     plt.show()
-    print("Saved: powell_river_cost_per_night.png")
+    print("Saved: outputs/sechelt_cost_per_night.png")
 
 
 def plot_demographics(scenarios: dict):
-    """Gender, age, readmission frequency — Baseline only."""
-    admitted = [ag for ag in scenarios["Baseline\n(no shelter)"]["agents"]
+    baseline_key = list(scenarios.keys())[0]
+    admitted = [ag for ag in scenarios[baseline_key]["agents"]
                 if ag.admission_count > 0]
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
-    gc    = Counter(ag.gender for ag in admitted)
+    gc = Counter(ag.gender for ag in admitted)
     axes[0].bar(gc.keys(), gc.values(), color=["#3498db","#e74c3c","#95a5a6"])
     axes[0].set_title("Admitted Agents by Gender (Baseline)")
     axes[0].set_ylabel("Count")
@@ -634,19 +807,20 @@ def plot_demographics(scenarios: dict):
 
     rc      = Counter(ag.admission_count for ag in admitted)
     max_adm = max(rc.keys(), default=1)
-    axes[2].bar(range(1, max_adm + 1),
-                [rc.get(i, 0) for i in range(1, max_adm + 1)],
-                color="#9b59b6")
+    axes[2].bar(range(1, max_adm+1), [rc.get(i, 0) for i in range(1, max_adm+1)], color="#9b59b6")
     axes[2].set_title("Admission Frequency per Agent (Baseline)")
     axes[2].set_xlabel("Total Admissions per Individual")
     axes[2].set_ylabel("Count")
 
-    fig.suptitle("Demographics — Admitted Homeless Individuals, Powell River ABM (Baseline)",
-                 fontsize=12, fontweight='bold')
+    fig.suptitle(
+        "Demographics — Admitted Homeless Individuals, Sechelt ABM (Baseline)\n"
+        "Rain City Shelter (25 perm + 10 Oct-Apr) + Gibsons Warming Centre",
+        fontsize=11, fontweight='bold'
+    )
     plt.tight_layout()
-    plt.savefig("/mnt/user-data/outputs/powell_river_demographics.png", dpi=150, bbox_inches='tight')
+    plt.savefig("outputs/sechelt_demographics.png", dpi=150, bbox_inches='tight')
     plt.show()
-    print("Saved: powell_river_demographics.png")
+    print("Saved: outputs/sechelt_demographics.png")
 
 
 # =============================================================================
@@ -654,20 +828,39 @@ def plot_demographics(scenarios: dict):
 # =============================================================================
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("Powell River Homeless ED Utilization ABM")
-    print(f"  Hospital capacity : {HOSPITAL_CAPACITY} beds (qathet General)")
-    print(f"  Start             : April 2026")
-    print(f"  Duration          : {SIM_MONTHS} months")
-    print(f"  Initial population: {INITIAL_POPULATION}")
-    print(f"  Admission prob    : {ADMISSION_PROB:.0%}  ← SWAP with Z59/(NFA+Z59)")
-    print(f"  LOS mean          : {LOS_MEAN_DAYS} days  ← SWAP with real data")
-    print("=" * 60 + "\n")
+    os.makedirs("outputs", exist_ok=True)
+
+    print("=" * 70)
+    print("Sechelt / shíshálh Homeless ED Utilization ABM")
+    print(f"  Hospital        : shíshálh Hospital — {HOSPITAL_CAPACITY} beds "
+          f"({HOSPITAL_ICU_BEDS} ICU ${COST_ICU_BED_DAY_LOW:,}-${COST_ICU_BED_DAY_HIGH:,}/day "
+          f"+ {HOSPITAL_NON_ICU_BEDS} non-ICU ${COST_NON_ICU_BED_DAY:,}/day)")
+    print(f"  Blended cost    : ${COST_HOSPITAL_BED_DAY:,}/day")
+    print(f"  Rain City       : ${RAINCITY_ANNUAL_COST:,.2f}/yr = ${RAINCITY_FIXED_MONTHLY:,.2f}/month")
+    print(f"  Rain City beds  : {RAINCITY_PERM_BEDS} permanent + {RAINCITY_WINTER_EXTRA_BEDS} Oct-Apr")
+    print(f"  Gibsons WC      : {WARMING_CENTRE_SPACES} spaces Oct-Apr, ${WARMING_CENTRE_FIXED_MONTHLY:,}/month")
+    print(f"  Readmission     : {READMISSION_PROB_30DAY:.1%} at 30d / "
+          f"{READMISSION_PROB_90DAY:.1%}/month at 31-90d (lit.)")
+    print(f"  Mortality       : {MONTHLY_MORTALITY_RATE}/month")
+    print(f"  New homeless    : lambda={NEW_HOMELESS_LAMBDA}/month")
+    print(f"  Sim start       : April 2026  |  {SIM_MONTHS} months")
+    print(f"  Initial pop     : {INITIAL_POPULATION}")
+    print(f"  Admission prob  : {ADMISSION_PROB:.0%}  <- SWAP with Z59/(NFA+Z59)")
+    print(f"  LOS mean        : {LOS_MEAN_DAYS} days  <- SWAP with real data")
+    print("=" * 70 + "\n")
 
     scenarios = run_all_scenarios(months=SIM_MONTHS, seed=RNG_SEED)
 
     print_summary(scenarios)
+    print_breakeven(scenarios)
+
     plot_cost_per_night()
     plot_main(scenarios, months=SIM_MONTHS)
     plot_cost_breakdown(scenarios, months=SIM_MONTHS)
+    plot_breakeven(scenarios, months=SIM_MONTHS)
     plot_demographics(scenarios)
+
+    baseline_admits  = sum(scenarios[list(scenarios.keys())[0]]["monthly_admissions"])
+    scen2_admits     = sum(scenarios[list(scenarios.keys())[1]]["monthly_admissions"])
+    print(f"Admissions avoided per month (Make 10 Permanent vs Baseline): "
+          f"{(baseline_admits - scen2_admits) / SIM_MONTHS:.1f}")
