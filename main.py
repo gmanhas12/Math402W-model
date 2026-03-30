@@ -31,6 +31,7 @@ All tunable parameters are in the PARAMETERS block only.
 
 from __future__ import annotations
 
+import bisect
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
@@ -60,6 +61,32 @@ ARRIVAL_LAMBDA      = 11          # Poisson mean: homeless individuals arriving 
 # ── Admission process ─────────────────────────────────────────────────────────
 ADMISSION_LAMBDA    = 10          # Poisson pool size n for Binomial draw
 ADMISSION_PROB      = 0.10        # Binomial p  ← SWAP with Z59/(NFA+Z59) from real data
+
+# ── Sickness index (-1 … 1) & admission coupling ─────────────────────────────
+# Index: 0 = average risk, +1 = much more likely ill, -1 = much less likely ill.
+# Poisson pool rate each month: ADMISSION_LAMBDA + (monthly avg sickness index) * weight
+SICKNESS_LAMBDA_WEIGHT          = 2.0     # scales avg sickness → extra Poisson rate
+# Who gets picked for first-time admission: weight_i = 1 + w * sickness_index(agent_i)
+SICKNESS_ADMISSION_DRAW_WEIGHT  = 0.5     # keep < 1 if s=-1 must stay positive (1+w*s>0)
+# Component scores (sum clamped to [-1, 1]); ← SWAP with calibration / literature
+SICKNESS_HOUSING_SCORE = {
+    "HOMELESS":       0.40,
+    "POST_DISCHARGE": 0.22,
+    "ADMITTED":       0.0,
+    "HOUSED":        -0.45,
+    "DECEASED":       0.0,
+}
+SICKNESS_AGE_SCORE = {
+    "18-29": -0.18,
+    "30-44":  0.0,
+    "45-59":  0.18,
+    "60+":    0.32,
+}
+SICKNESS_GENDER_SCORE = {
+    "Male":   0.06,
+    "Female": -0.06,
+    "Other":  0.0,
+}
 
 # ── Length of stay ────────────────────────────────────────────────────────────
 LOS_MEAN_DAYS       = 15.4        # ← SWAP with mean(discharge_date - admission_date)
@@ -209,6 +236,54 @@ class Agent:
     @property
     def eligible_readmission(self)  -> bool: return self.state is State.POST_DISCHARGE
 
+    @property
+    def sickness_index(self) -> float:
+        """Composite risk in [-1, 1] from housing state, age, and gender."""
+        h = SICKNESS_HOUSING_SCORE[self.state.name]
+        a = SICKNESS_AGE_SCORE.get(self.age_group, 0.0)
+        g = SICKNESS_GENDER_SCORE.get(self.gender, 0.0)
+        return float(max(-1.0, min(1.0, h + a + g)))
+
+
+def _monthly_avg_sickness_index(agents: list[Agent]) -> float:
+    active = [ag for ag in agents if ag.is_active]
+    if not active:
+        return 0.0
+    return float(np.mean([ag.sickness_index for ag in active]))
+
+
+def _weighted_admit_sample(
+    eligible: list[Agent],
+    k: int,
+    draw_weight: float,
+    rng: np.random.Generator,
+) -> list[Agent]:
+    """
+    Without replacement: k distinct agents with P(i) ∝ 1 + draw_weight * sickness_index(i).
+    Cumulative weights + Uniform(0, sum) + bisect_right for each draw.
+    """
+    if k <= 0 or not eligible:
+        return []
+    pool = list(range(len(eligible)))
+    out: list[Agent] = []
+    for _ in range(min(k, len(eligible))):
+        weights = [
+            max(1e-12, 1.0 + draw_weight * eligible[i].sickness_index)
+            for i in pool
+        ]
+        cum: list[float] = []
+        s = 0.0
+        for w in weights:
+            s += w
+            cum.append(s)
+        u = rng.random() * s
+        j = bisect.bisect_right(cum, u)
+        if j >= len(pool):
+            j = len(pool) - 1
+        pos = pool.pop(j)
+        out.append(eligible[pos])
+    return out
+
 
 # =============================================================================
 # SIMULATION ENGINE
@@ -347,31 +422,41 @@ def run_simulation(
         # ── 7. First-time admissions ──────────────────────────────────────────
         current_occupancy  = sum(1 for ag in agents if ag.in_bed)
         eligible_new       = [ag for ag in agents if ag.eligible_new_admission]
-        n_pool             = rng.poisson(admission_lambda)
+        avg_sickness       = _monthly_avg_sickness_index(agents)
+        pool_lambda        = max(0.0, admission_lambda + avg_sickness * SICKNESS_LAMBDA_WEIGHT)
+        n_pool             = rng.poisson(pool_lambda)
         n_admit_draw       = rng.binomial(n_pool, p_adm)
         n_admit            = min(n_admit_draw, len(eligible_new))
         n_overflow_this    = 0
 
         if n_admit > 0:
-            chosen = rng.choice(len(eligible_new), size=n_admit, replace=False)
-            for idx in chosen:
+            picked = _weighted_admit_sample(
+                eligible_new, n_admit, SICKNESS_ADMISSION_DRAW_WEIGHT, rng
+            )
+            for ag in picked:
                 los = max(1.0, rng.normal(los_mean, los_sd))
-                eligible_new[idx].admit(sim_month, los)
+                ag.admit(sim_month, los)
                 current_occupancy += 1
                 if current_occupancy > HOSPITAL_CAPACITY:
                     n_overflow_this += 1   # flag: over 42-bed capacity
 
-        # ── 8. Readmissions ───────────────────────────────────────────────────
+        # ── 8. Readmissions (same weighted pick as first-time: Binomial count, then ∝ 1+w·s) ──
         eligible_readm = [ag for ag in agents if ag.eligible_readmission]
         n_readmit = 0
-        for ag in eligible_readm:
-            if rng.random() < p_rdm:
-                los = max(1.0, rng.normal(los_mean, los_sd))
-                ag.admit(sim_month, los)
-                n_readmit      += 1
-                current_occupancy += 1
-                if current_occupancy > HOSPITAL_CAPACITY:
-                    n_overflow_this += 1
+        if eligible_readm:
+            n_readmit_draw = rng.binomial(len(eligible_readm), p_rdm)
+            k_readmit = min(n_readmit_draw, len(eligible_readm))
+            if k_readmit > 0:
+                picked_readm = _weighted_admit_sample(
+                    eligible_readm, k_readmit, SICKNESS_ADMISSION_DRAW_WEIGHT, rng
+                )
+                for ag in picked_readm:
+                    los = max(1.0, rng.normal(los_mean, los_sd))
+                    ag.admit(sim_month, los)
+                    n_readmit += 1
+                    current_occupancy += 1
+                    if current_occupancy > HOSPITAL_CAPACITY:
+                        n_overflow_this += 1
 
         # ── 9. Shelter / warming-centre operating costs ───────────────────────
         shelter_cost_this = 0.0
