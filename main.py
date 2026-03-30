@@ -31,6 +31,7 @@ All tunable parameters are in the PARAMETERS block only.
 
 from __future__ import annotations
 
+import bisect
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
@@ -46,7 +47,7 @@ from typing import Optional
 # =============================================================================
 
 # ── Simulation ────────────────────────────────────────────────────────────────
-SIM_MONTHS          = 24          # months to simulate
+SIM_MONTHS          = 120         # months to simulate (10-year horizon)
 SIM_START_MONTH     = 4           # April (month 1 of sim = April 2026)
 RNG_SEED            = 42
 
@@ -56,10 +57,37 @@ HOSPITAL_CAPACITY   = 42          # qathet General Hospital acute beds
 # ── Arrival process ───────────────────────────────────────────────────────────
 ARRIVAL_LAMBDA      = 11          # Poisson mean: homeless individuals arriving at ED/month
                                   # ← SWAP with real ED visit counts once data arrives
+ARRIVAL_SICKNESS_WEIGHT = 5.0    # scales avg sickness → extra Poisson rate for ED arrivals
 
 # ── Admission process ─────────────────────────────────────────────────────────
 ADMISSION_LAMBDA    = 10          # Poisson pool size n for Binomial draw
 ADMISSION_PROB      = 0.10        # Binomial p  ← SWAP with Z59/(NFA+Z59) from real data
+
+# ── Sickness index (-1 … 1) & admission coupling ─────────────────────────────
+# Index: 0 = average risk, +1 = much more likely ill, -1 = much less likely ill.
+# Poisson pool rate each month: ADMISSION_LAMBDA + (monthly avg sickness index) * weight
+SICKNESS_LAMBDA_WEIGHT          = 2.0     # scales avg sickness → extra Poisson rate
+# Who gets picked for first-time admission: weight_i = 1 + w * sickness_index(agent_i)
+SICKNESS_ADMISSION_DRAW_WEIGHT  = 0.5     # keep < 1 if s=-1 must stay positive (1+w*s>0)
+# Component scores (sum clamped to [-1, 1]); ← SWAP with calibration / literature
+SICKNESS_HOUSING_SCORE = {
+    "HOMELESS":       0.40,
+    "POST_DISCHARGE": 0.22,
+    "ADMITTED":       0.0,
+    "HOUSED":        -0.45,
+    "DECEASED":       0.0,
+}
+SICKNESS_AGE_SCORE = {
+    "18-29": -0.18,
+    "30-44":  0.0,
+    "45-59":  0.18,
+    "60+":    0.32,
+}
+SICKNESS_GENDER_SCORE = {
+    "Male":   0.06,
+    "Female": -0.06,
+    "Other":  0.0,
+}
 
 # ── Length of stay ────────────────────────────────────────────────────────────
 LOS_MEAN_DAYS       = 15.4        # ← SWAP with mean(discharge_date - admission_date)
@@ -120,22 +148,26 @@ WARMING_CENTRE_FIXED_MONTHLY    = 40_000  # CAD/month while open
                                           # ← SWAP with actual contract value
 
 # ── Shelter diversion effects ─────────────────────────────────────────────────
-# How much each shelter type reduces ED pressure
-# These are conservative estimates; ← SWAP with literature values or calibrated data
+# How shelters change utilization
+# (ED arrival diversion is now sickness-driven; other effects remain calibrated here.)
 
 # Year-round shelter (Driftwood)
-SHELTER_ARRIVAL_REDUCTION       = 0.25   # 25% of ED arrivals diverted
 SHELTER_ADMISSION_REDUCTION     = 0.05   # absolute drop in admission probability
 SHELTER_READMISSION_REDUCTION   = 0.08   # absolute drop in readmission probability
-SHELTER_EXIT_BOOST              = 0.01   # extra monthly housing exit probability
+
+# Sheltered agents transitioning to housing are modeled explicitly.
+SHELTER_HOUSING_LAMBDA          = 1.6    # Poisson mean: sheltered agents/month finding housing
+SHELTER_DROPOUT_RATE            = 0.05   # 5% monthly chance sheltered agents leave shelter to street
+
+# Shelter effect on population sickness index for homeless agents.
+# This reduces avg sickness, which then lowers ED arrival rate (via ARRIVAL_SICKNESS_WEIGHT).
+SHELTER_SICKNESS_REDUCTION       = 0.40   # subtract from agent's sickness_index when in shelter
 
 # Second 40-bed shelter (additive on top of Driftwood)
-EXTRA_SHELTER_ARRIVAL_REDUCTION     = 0.10   # additional 10% diversion
 EXTRA_SHELTER_ADMISSION_REDUCTION   = 0.02
 EXTRA_SHELTER_READMISSION_REDUCTION = 0.03
 
 # Warming centre (winter-only, smaller effect)
-WARMING_ARRIVAL_REDUCTION       = 0.08   # 8% additional winter diversion
 WARMING_ADMISSION_REDUCTION     = 0.03
 WARMING_READMISSION_REDUCTION   = 0.04
 
@@ -160,6 +192,8 @@ class Agent:
     age_group:   str = "30-44"
 
     state:                   State         = State.HOMELESS
+    in_shelter:              bool          = False  # eligible if state == HOMELESS
+    in_warming_centre:       bool          = False  # temporary monthly assignment
     admission_count:         int           = 0
     current_admission_month: Optional[int] = None
     los_days:                float         = 0.0
@@ -181,8 +215,17 @@ class Agent:
         self.discharge_month   = month
         self.months_post_discharge = 0
 
-    def house(self):  self.state = State.HOUSED
-    def die(self):    self.state = State.DECEASED
+    def house(self):
+        self.state = State.HOUSED
+        # Leaving homelessness also releases any shelter/warming occupancy flags.
+        self.in_shelter = False
+        self.in_warming_centre = False
+
+    def die(self):
+        self.state = State.DECEASED
+        # Deceased agents no longer occupy shelter beds.
+        self.in_shelter = False
+        self.in_warming_centre = False
 
     def update(self, current_month: int, days_in_month: int = 30) -> float:
         """Advance one month. Returns bed-days consumed."""
@@ -208,6 +251,57 @@ class Agent:
     def eligible_new_admission(self)-> bool: return self.state is State.HOMELESS
     @property
     def eligible_readmission(self)  -> bool: return self.state is State.POST_DISCHARGE
+
+    @property
+    def sickness_index(self) -> float:
+        """Composite risk in [-1, 1] from housing state, age, and gender."""
+        h = SICKNESS_HOUSING_SCORE[self.state.name]
+        a = SICKNESS_AGE_SCORE.get(self.age_group, 0.0)
+        g = SICKNESS_GENDER_SCORE.get(self.gender, 0.0)
+        base = h + a + g
+        if self.in_shelter or self.in_warming_centre:
+            base -= SHELTER_SICKNESS_REDUCTION
+        return float(max(-1.0, min(1.0, base)))
+
+
+def _monthly_avg_sickness_index(agents: list[Agent]) -> float:
+    active = [ag for ag in agents if ag.is_active]
+    if not active:
+        return 0.0
+    return float(np.mean([ag.sickness_index for ag in active]))
+
+
+def _weighted_admit_sample(
+    eligible: list[Agent],
+    k: int,
+    draw_weight: float,
+    rng: np.random.Generator,
+) -> list[Agent]:
+    """
+    Without replacement: k distinct agents with P(i) ∝ 1 + draw_weight * sickness_index(i).
+    Cumulative weights + Uniform(0, sum) + bisect_right for each draw.
+    """
+    if k <= 0 or not eligible:
+        return []
+    pool = list(range(len(eligible)))
+    out: list[Agent] = []
+    for _ in range(min(k, len(eligible))):
+        weights = [
+            max(1e-12, 1.0 + draw_weight * eligible[i].sickness_index)
+            for i in pool
+        ]
+        cum: list[float] = []
+        s = 0.0
+        for w in weights:
+            s += w
+            cum.append(s)
+        u = rng.random() * s
+        j = bisect.bisect_right(cum, u)
+        if j >= len(pool):
+            j = len(pool) - 1
+        pos = pool.pop(j)
+        out.append(eligible[pos])
+    return out
 
 
 # =============================================================================
@@ -240,20 +334,14 @@ def run_simulation(
     eff_exit_base  = MONTHLY_SPONTANEOUS_EXIT
     eff_adm_base   = admission_prob
     eff_readm_base = readmission_prob
-    eff_arr_lambda = arrival_lambda
 
     if driftwood_open:
-        eff_arr_lambda  *= (1 - SHELTER_ARRIVAL_REDUCTION)
         eff_adm_base    -= SHELTER_ADMISSION_REDUCTION
         eff_readm_base  -= SHELTER_READMISSION_REDUCTION
-        eff_exit_base   += SHELTER_EXIT_BOOST
 
     if extra_shelter:
-        eff_arr_lambda  *= (1 - EXTRA_SHELTER_ARRIVAL_REDUCTION)
         eff_adm_base    -= EXTRA_SHELTER_ADMISSION_REDUCTION
         eff_readm_base  -= EXTRA_SHELTER_READMISSION_REDUCTION
-
-    eff_arr_lambda  = max(0.0, eff_arr_lambda)
     eff_adm_base    = max(0.0, eff_adm_base)
     eff_readm_base  = max(0.0, eff_readm_base)
 
@@ -274,6 +362,26 @@ def run_simulation(
 
     for _ in range(initial_agents):
         agents.append(_new_agent(0))
+
+    # ── Persistent year-round shelter occupancy at month 0 ───────────────────
+    active_year_round_shelter_capacity = 0
+    if driftwood_open:
+        active_year_round_shelter_capacity += DRIFTWOOD_CAPACITY
+    if extra_shelter:
+        active_year_round_shelter_capacity += ADDITIONAL_SHELTER_CAPACITY
+
+    if active_year_round_shelter_capacity > 0:
+        n_target_sheltered = int(active_year_round_shelter_capacity * 0.75)
+        initial_homeless = [ag for ag in agents if ag.state is State.HOMELESS]
+        n_target_sheltered = min(n_target_sheltered, len(initial_homeless))
+        if n_target_sheltered > 0:
+            sheltered_idxs = rng.choice(
+                len(initial_homeless),
+                size=n_target_sheltered,
+                replace=False,
+            )
+            for idx in sheltered_idxs:
+                initial_homeless[int(idx)].in_shelter = True
 
     # ── Monthly output lists ──────────────────────────────────────────────────
     monthly_arrivals       = []
@@ -314,24 +422,86 @@ def run_simulation(
                 ag.die()
                 deaths_this += 1
 
-        # ── 3. Spontaneous exits ──────────────────────────────────────────────
+        # ── 3. Monthly housing exits ───────────────────────────────────────────
         exits_this = 0
+        # (a) Standard unsheltered homeless exits
         for ag in agents:
-            if ag.state is State.HOMELESS and rng.random() < eff_exit_base:
+            if ag.state is State.HOMELESS and (not ag.in_shelter) and rng.random() < eff_exit_base:
                 ag.house()
                 exits_this += 1
+
+        # (b) Sheltered agents finding housing explicitly (Poisson draw)
+        sheltered_for_housing = [ag for ag in agents if ag.in_shelter]
+        n_housed = rng.poisson(SHELTER_HOUSING_LAMBDA)
+        n_housed = min(n_housed, len(sheltered_for_housing))
+        if n_housed > 0:
+            housed_idxs = rng.choice(
+                len(sheltered_for_housing),
+                size=n_housed,
+                replace=False,
+            )
+            for idx in housed_idxs:
+                ag = sheltered_for_housing[int(idx)]
+                ag.house()
+                ag.in_shelter = False
+                exits_this += 1
+
+        # (c) Shelter dropout: remaining sheltered agents may lose beds
+        for ag in agents:
+            if ag.in_shelter and rng.random() < SHELTER_DROPOUT_RATE:
+                ag.in_shelter = False
 
         # ── 4. New homeless entries ───────────────────────────────────────────
         n_new = rng.poisson(NEW_HOMELESS_LAMBDA)
         for _ in range(n_new):
             agents.append(_new_agent(sim_month))
 
-        # ── 5. ED arrivals ────────────────────────────────────────────────────
-        # Warming centre provides additional winter diversion on top of shelter effects
-        arr_lambda_this = eff_arr_lambda
+        # ── 4b. Persistent year-round shelter beds + warming centre ───────────
+        # Warming centre is temporary: reset every month, then assign if active.
+        for ag in agents:
+            ag.in_warming_centre = False
+
+        active_year_round_shelter_capacity = 0
+        if driftwood_open:
+            active_year_round_shelter_capacity += DRIFTWOOD_CAPACITY
+        if extra_shelter:
+            active_year_round_shelter_capacity += ADDITIONAL_SHELTER_CAPACITY
+
+        # Persistent beds refilling: DO NOT reset in_shelter for everyone.
+        currently_sheltered = sum(1 for ag in agents if ag.in_shelter)
+        available_beds = active_year_round_shelter_capacity - currently_sheltered
+        if available_beds > 0:
+            unsheltered_homeless = [ag for ag in agents if ag.state is State.HOMELESS and (not ag.in_shelter)]
+            n_to_fill = min(available_beds, len(unsheltered_homeless))
+            if n_to_fill > 0:
+                fill_idxs = rng.choice(
+                    len(unsheltered_homeless),
+                    size=n_to_fill,
+                    replace=False,
+                )
+                for idx in fill_idxs:
+                    unsheltered_homeless[int(idx)].in_shelter = True
+
+        # Warming centre assignment (seasonal, temporary, separate boolean)
         if warming_centre and is_warming_season:
-            arr_lambda_this *= (1 - WARMING_ARRIVAL_REDUCTION)
-        arr_lambda_this = max(0.0, arr_lambda_this)
+            eligible_warming = [
+                ag for ag in agents
+                if ag.state is State.HOMELESS and (not ag.in_shelter)
+            ]
+            n_warming = min(WARMING_CENTRE_CAPACITY, len(eligible_warming))
+            if n_warming > 0:
+                warming_idxs = rng.choice(
+                    len(eligible_warming),
+                    size=n_warming,
+                    replace=False,
+                )
+                for idx in warming_idxs:
+                    eligible_warming[int(idx)].in_warming_centre = True
+
+        # ── 5. ED arrivals ────────────────────────────────────────────────────
+        # Monthly arrival rate is driven by average sickness (shelters reduce sickness).
+        avg_sickness = _monthly_avg_sickness_index(agents)
+        arr_lambda_this = max(0.0, arrival_lambda + avg_sickness * ARRIVAL_SICKNESS_WEIGHT)
         n_arrivals = rng.poisson(arr_lambda_this)
 
         # ── 6. Effective admission probability ────────────────────────────────
@@ -347,31 +517,40 @@ def run_simulation(
         # ── 7. First-time admissions ──────────────────────────────────────────
         current_occupancy  = sum(1 for ag in agents if ag.in_bed)
         eligible_new       = [ag for ag in agents if ag.eligible_new_admission]
-        n_pool             = rng.poisson(admission_lambda)
+        pool_lambda        = max(0.0, admission_lambda + avg_sickness * SICKNESS_LAMBDA_WEIGHT)
+        n_pool             = rng.poisson(pool_lambda)
         n_admit_draw       = rng.binomial(n_pool, p_adm)
         n_admit            = min(n_admit_draw, len(eligible_new))
         n_overflow_this    = 0
 
         if n_admit > 0:
-            chosen = rng.choice(len(eligible_new), size=n_admit, replace=False)
-            for idx in chosen:
+            picked = _weighted_admit_sample(
+                eligible_new, n_admit, SICKNESS_ADMISSION_DRAW_WEIGHT, rng
+            )
+            for ag in picked:
                 los = max(1.0, rng.normal(los_mean, los_sd))
-                eligible_new[idx].admit(sim_month, los)
+                ag.admit(sim_month, los)
                 current_occupancy += 1
                 if current_occupancy > HOSPITAL_CAPACITY:
                     n_overflow_this += 1   # flag: over 42-bed capacity
 
-        # ── 8. Readmissions ───────────────────────────────────────────────────
+        # ── 8. Readmissions (same weighted pick as first-time: Binomial count, then ∝ 1+w·s) ──
         eligible_readm = [ag for ag in agents if ag.eligible_readmission]
         n_readmit = 0
-        for ag in eligible_readm:
-            if rng.random() < p_rdm:
-                los = max(1.0, rng.normal(los_mean, los_sd))
-                ag.admit(sim_month, los)
-                n_readmit      += 1
-                current_occupancy += 1
-                if current_occupancy > HOSPITAL_CAPACITY:
-                    n_overflow_this += 1
+        if eligible_readm:
+            n_readmit_draw = rng.binomial(len(eligible_readm), p_rdm)
+            k_readmit = min(n_readmit_draw, len(eligible_readm))
+            if k_readmit > 0:
+                picked_readm = _weighted_admit_sample(
+                    eligible_readm, k_readmit, SICKNESS_ADMISSION_DRAW_WEIGHT, rng
+                )
+                for ag in picked_readm:
+                    los = max(1.0, rng.normal(los_mean, los_sd))
+                    ag.admit(sim_month, los)
+                    n_readmit += 1
+                    current_occupancy += 1
+                    if current_occupancy > HOSPITAL_CAPACITY:
+                        n_overflow_this += 1
 
         # ── 9. Shelter / warming-centre operating costs ───────────────────────
         shelter_cost_this = 0.0
