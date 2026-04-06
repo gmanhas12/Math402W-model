@@ -533,11 +533,13 @@ def run_simulation(
         if sechelt_wc and is_sechelt_season:
             shelter_cost_this += SECHELT_WC_FIXED_MONTHLY
 
-        # Hospital costs: fixed base ($151M/yr) + homeless-attributable bed-days
+        # Hospital costs:
+        # - base ($151M/yr) tracked separately as context; NOT added to scenario total
+        # - PEH-attributable bed-day cost is the scenario-sensitive variable
         hosp_base_this     = HOSPITAL_BASE_MONTHLY
         hosp_homeless_this = bed_days_this * COST_HOSPITAL_BED_DAY
-        hospital_cost      = hosp_base_this + hosp_homeless_this
-        total_cost         = hospital_cost + shelter_cost_this
+        hospital_cost      = hosp_base_this + hosp_homeless_this  # full hospital cost (reference only)
+        total_cost         = hosp_homeless_this + shelter_cost_this  # scenario comparison total (no double-count)
 
         occupancy    = sum(1 for ag in agents if ag.in_bed)
         pop_homeless = sum(1 for ag in agents if ag.state is State.HOMELESS)
@@ -612,29 +614,31 @@ def run_all_scenarios(months: int = SIM_MONTHS, seed: int = RNG_SEED) -> dict:
 
 def print_summary(scenarios: dict):
     baseline_cost = sum(list(scenarios.values())[0]["monthly_cost_total"])
-    w = 130
+    w = 120
+    annual_base_M = HOSPITAL_ANNUAL_OPERATING_COST / 1e6
+    sim_years = SIM_MONTHS / 12
     print("\n" + "=" * w)
-    print(f"{'Scenario':<38} {'Admits':>7} {'Re-adm':>7} {'Overflow':>9} "
-          f"{'Bed-Days':>10} {'Deaths':>7} "
-          f"{'Hosp Base $M':>13} {'PEH $M':>8} {'Shelter $M':>11} {'Total $M':>10} {'vs Baseline':>13}")
-    print("  (Hospital base = $151M/yr fixed; PEH = homeless-attributable bed-day costs)")
+    print(f"  Hospital base operating cost: ${annual_base_M:.0f}M/yr "
+          f"(${annual_base_M * sim_years:.0f}M over {sim_years:.0f} yrs) — reference only, not in scenario totals")
+    print(f"  Scenario totals = PEH bed-day costs + shelter operating costs only (no double-count)")
+    print("=" * w)
+    print(f"{'Scenario':<42} {'Admits':>7} {'Re-adm':>7} {'Bed-Days':>10} {'Deaths':>7} "
+          f"{'PEH Hosp $M':>12} {'Shelter $M':>11} {'Total $M':>10} {'vs Baseline':>13}")
     print("=" * w)
     for name, res in scenarios.items():
         label    = name.replace("\n", " ")
         admits   = sum(res["monthly_admissions"])
         readmits = sum(res["monthly_readmissions"])
-        overflow = sum(res["monthly_overflow"])
         bed_days = sum(res["monthly_bed_days"])
         deaths   = sum(res["monthly_deaths"])
-        h_base   = sum(res["monthly_cost_hospital_base"])
         h_peh    = sum(res["monthly_cost_hospital_homeless"])
         s_cost   = sum(res["monthly_cost_shelter"])
         t_cost   = sum(res["monthly_cost_total"])
         delta    = baseline_cost - t_cost
         dstr     = f"-${delta/1e6:.3f}M" if delta >= 0 else f"+${abs(delta)/1e6:.3f}M"
-        print(f"{label:<38} {admits:>7} {readmits:>7} {overflow:>9} "
-              f"{bed_days:>10.0f} {deaths:>7} "
-              f"{h_base/1e6:>13.1f} {h_peh/1e6:>8.3f} {s_cost/1e6:>11.3f} {t_cost/1e6:>10.1f} {dstr:>13}")
+        peh_pct  = (h_peh / (HOSPITAL_ANNUAL_OPERATING_COST * sim_years)) * 100
+        print(f"{label:<42} {admits:>7} {readmits:>7} {bed_days:>10.0f} {deaths:>7} "
+              f"{h_peh/1e6:>10.3f}M ({peh_pct:.1f}%) {s_cost/1e6:>9.3f} {t_cost/1e6:>10.3f} {dstr:>13}")
     print("=" * w + "\n")
 
 
@@ -818,54 +822,52 @@ def plot_main(scenarios: dict, months: int = SIM_MONTHS):
 
 def plot_cost_breakdown(scenarios: dict, months: int = SIM_MONTHS):
     """
-    Stacked bar with THREE layers per scenario:
-      1. Hospital base operating cost (grey)  — fixed $151M/yr × sim years
-      2. PEH-attributable bed-day costs (red) — varies by scenario
-      3. Shelter / warming-centre costs (blue)— varies by scenario
+    Stacked bar: PEH bed-day costs (red) + shelter costs (blue).
+    Hospital base operating cost ($151M/yr) shown as reference line only — not stacked,
+    to avoid double-counting with the blended bed-day rate.
     """
-    names      = [n.replace("\n", " ") for n in scenarios]
-    base_cum   = [sum(s["monthly_cost_hospital_base"])     / 1e6 for s in scenarios.values()]
-    peh_cum    = [sum(s["monthly_cost_hospital_homeless"]) / 1e6 for s in scenarios.values()]
-    shlt_cum   = [sum(s["monthly_cost_shelter"])           / 1e6 for s in scenarios.values()]
-    x          = np.arange(len(names))
-    w          = 0.5
+    names    = [n.replace("\n", " ") for n in scenarios]
+    peh_cum  = [sum(s["monthly_cost_hospital_homeless"]) / 1e6 for s in scenarios.values()]
+    shlt_cum = [sum(s["monthly_cost_shelter"])           / 1e6 for s in scenarios.values()]
+    x        = np.arange(len(names))
+    w        = 0.5
+    sim_years = months / 12
+    base_ref  = HOSPITAL_ANNUAL_OPERATING_COST * sim_years / 1e6
 
     fig, ax = plt.subplots(figsize=(12, 6))
-
-    ax.bar(x, base_cum, w,
-           label="Hospital base operating cost ($151M/yr fixed)",
-           color="#95a5a6", alpha=0.88)
-    ax.bar(x, peh_cum, w, bottom=base_cum,
-           label="PEH-attributable bed-day costs (varies by scenario)",
+    ax.bar(x, peh_cum, w,
+           label="PEH-attributable bed-day costs (scenario variable)",
            color="#e74c3c", alpha=0.88)
-    ax.bar(x, shlt_cum, w,
-           bottom=[b + p for b, p in zip(base_cum, peh_cum)],
+    ax.bar(x, shlt_cum, w, bottom=peh_cum,
            label="Shelter / Warming-centre operating costs",
            color="#3498db", alpha=0.88)
 
-    baseline_total = base_cum[0] + peh_cum[0] + shlt_cum[0]
-    for i, (b, p, s) in enumerate(zip(base_cum, peh_cum, shlt_cum)):
-        total  = b + p + s
-        saving = baseline_total - total
-        label  = f"${total:.1f}M"
+    baseline_total = peh_cum[0] + shlt_cum[0]
+    for i, (p, s) in enumerate(zip(peh_cum, shlt_cum)):
+        total   = p + s
+        saving  = baseline_total - total
+        peh_pct = (p / base_ref) * 100
+        label   = f"${total:.2f}M\n(PEH = {peh_pct:.1f}% of hosp. budget)"
         if saving > 0:
-            label += f"\n(saves ${saving:.2f}M\nvs baseline)"
-        ax.text(i, total + 0.5, label,
-                ha='center', va='bottom', fontsize=8.5, fontweight='bold')
+            label += f"\nsaves ${saving:.2f}M vs baseline"
+        ax.text(i, total + 0.05, label,
+                ha='center', va='bottom', fontsize=8, fontweight='bold')
 
-    ax.axhline(baseline_total, color='grey', ls='--', lw=1, alpha=0.6,
-               label="Baseline total")
+    ax.axhline(base_ref, color='grey', ls='--', lw=1.5, alpha=0.7,
+               label=f"Hospital total operating cost over {sim_years:.0f} yrs "
+                     f"(${base_ref:.0f}M — reference only, not in bars)")
+
     ax.set_xticks(x)
     ax.set_xticklabels(names, fontsize=8)
     ax.set_ylabel("Cumulative Cost (M CAD)")
     ax.set_title(
         f"Cumulative Cost Breakdown Over {months} Months — Sechelt ABM\n"
-        f"Hospital base operating cost ($151M/yr) included for full financial context",
+        f"Bars show PEH-attributable costs only. Hospital base (${HOSPITAL_ANNUAL_OPERATING_COST/1e6:.0f}M/yr) "
+        f"shown as reference line.",
         fontsize=11
     )
-    ax.legend(fontsize=8, loc='upper right')
+    ax.legend(fontsize=8, loc='upper left')
     ax.grid(axis='y', alpha=0.25)
-
     plt.tight_layout()
     plt.savefig("outputs/sechelt_cost_breakdown.png", dpi=150, bbox_inches='tight')
     plt.show()
